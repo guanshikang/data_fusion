@@ -35,6 +35,7 @@ import torch.nn.functional as F
 import torch.utils.data as data_utils
 from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.cuda.amp import autocast
 
 from FunctionalCode.CommonFuncs import CommonFuncs
 from FunctionalCode.GlobalStats import ComputeStats
@@ -44,7 +45,15 @@ from Backbone.UNet import UNet
 from Backbone.SpatioTemporalViT import SpatioTemporalViT
 from Backbone.STViT import ViTTimeSeriesModel
 from Backbone.ViT_SkipConnection import ViT_Skip
-# from Backbone.SwinTransformer import SwinTransformer
+from Backbone.SwinTransformer import SwinTransformer
+
+
+SEASON = {
+    'MAM': ["03", "04", "05"],
+    'JJA': ["06", "07", "08"],
+    'SON': ["09", "10", "11"],
+    'DJF': ["12", "01", "02"]
+}
 
 
 class SplitDataset:
@@ -56,8 +65,7 @@ class SplitDataset:
 
     def __get_dataset(self, label_dir, ref_dir):
         sites = os.listdir(ref_dir)
-        files = map(lambda x: glob.glob(os.path.join(
-            label_dir, x, "*_202[2-4]*_202*.tif")), sites)
+        files = map(lambda x: self._filter_by_season(label_dir, x), sites)
         files = list(itertools.chain.from_iterable(files))
         file_num = len(files)
         tiles = set(map(
@@ -74,19 +82,21 @@ class SplitDataset:
         val_num = train_num + int(file_num * .1)
         num = 0
         for tile in tiles:
-            files = map(lambda x: glob.glob(os.path.join(
-                label_dir, x, f"*_{tile}_202[2-4]*.tif"
-            )), sites)
-            files = list(itertools.chain.from_iterable(files))
-            num += len(files)
+            temp_files = filter(
+                lambda x: re.match(f"LC09.*_{tile}_2023.*.tif",
+                                   os.path.basename(x)),
+                files
+            )
+            temp_files = list(temp_files)
+            num += len(temp_files)
             train_ratio = (num - train_num) / file_num
             val_ratio = (num - val_num) / file_num
             if train_ratio < 0:
-                dataset["train"].extend(files)
+                dataset["train"].extend(temp_files)
             elif val_ratio < 0:
-                dataset["val"].extend(files)
+                dataset["val"].extend(temp_files)
             else:
-                dataset["test"].extend(files)
+                dataset["test"].extend(temp_files)
 
         return dataset
 
@@ -95,6 +105,24 @@ class SplitDataset:
             dict([(k, pd.Series(v)) for k, v in self.dataset.items()])
         )
         df.to_csv(file_path)
+
+    def _filter_by_season(self, label_dir, site):
+
+        files = []
+        for i in range(3, 4):
+            temp_files = glob.glob(os.path.join(
+                label_dir, site, "*_202%d*_202[2-4]*.tif" % i
+            ))
+            if len(temp_files) > 0:
+                for value in SEASON.values():
+                    temp_file = list(filter(
+                        lambda x: re.findall("\\d{8}", x)[0][4:6] in value,
+                        temp_files
+                    ))
+                    if len(temp_file) > 0:
+                        files.append(random.choice(temp_file))
+
+        return files
 
 
 class AlignDataset:
@@ -149,7 +177,7 @@ class DataLoader(data_utils.Dataset):
     """
     def __init__(self, landsat_path, modis_path, label_path, files,
                  out_channels=7, image_size=256, num_pairs=3, cloud_cover=30,
-                 stats=None, MOD_idx=None):
+                 stats=None, MODIS=False):
         self.landsat_path = landsat_path
         self.modis_path = modis_path
         self.label_path = label_path
@@ -161,7 +189,7 @@ class DataLoader(data_utils.Dataset):
         self.site_names = self.__get_sitenames()
         self.stats = stats
         self.standardizable = stats is not None
-        self.MOD_idx = MOD_idx
+        self.MODIS = MODIS
 
     def __get_sitenames(self):
         return [x.split("/")[-2] for x in self.files]
@@ -202,18 +230,68 @@ class DataLoader(data_utils.Dataset):
         calendar = "standard"
         date = nc.date2num(target_date, units=units, calendar=calendar)
         time_landsat = landsat_dst['time']
-        # OPTION 1: 选择有限的图像对
+        # OPTION 1: Limited Image Pairs
         # START
+        # # Time Range
+        # SUB OPTION 1: Random Search in Same Season
+        def filter_by_season(date, time_dst, units, calendar, same_year=False):
+            target_month = date.month
+            target_season = {
+                k: v for k, v in SEASON.items()
+                if str(target_month).zfill(2) in v
+            }
+            season = [x for x in target_season.keys()][0]
+            months = [x for x in target_season.values()][0]
+            ori_date = nc.num2date(time_dst.values, units=units,
+                                   calendar=calendar)
+            target_year = date.year
+            if same_year:
+                end_date = nc.date2num(
+                    datetime.strptime("%d%d" % (target_year, int(months[-1]) + 1),
+                                    "%Y%m"),
+                    units, calendar
+                )
+                if season == "DJF":
+                    target_year -= 1
+                start_date = nc.date2num(
+                    datetime.strptime("%d%s" % (target_year, months[0]),
+                                    "%Y%m"),
+                    units, calendar
+                )
+                temp_date = ori_date[
+                    (start_date <= time_dst.values) & (time_dst.values < end_date)
+                ]
+                idx = np.argwhere(np.isin(ori_date, temp_date))
+                return [x[0] for x in idx]
+
+            ori_month = list(map(
+                lambda x: str(x.month).zfill(2),
+                ori_date
+            ))
+            idx = np.argwhere(np.isin(ori_month, months))
+
+            return [x[0] for x in idx]
+
+        season_idx_landsat = filter_by_season(target_date, time_landsat,
+                                              units, calendar)
+        season_landsat = time_landsat[season_idx_landsat]
+        season_mask = landsat_mask[season_idx_landsat]
+        # SUB OPTION 3: Random Search in the Whole Time Range (3 years)
+        # PASS
         length = 2 * self.num_pairs  # * Here is for the num of image pairs.
-        least_idx = np.argmin(np.abs(time_landsat.values - date))
+        least_idx = np.argmin(np.abs(season_landsat.values - date))
         idx = []
-        for i, clear_data in enumerate(landsat_mask):
+        for i, clear_data in enumerate(season_mask):
             clear_data = clear_data.values
             clear_ratio = np.sum(clear_data == 1) * 100 / \
                 (clear_data.shape[0] * clear_data.shape[1])
             if clear_ratio >= 100 - self.cloud_cover:
                 idx.append(i)
         idx = np.array(idx)
+        if len(idx) == 0:
+            return [], []
+        target_idx = np.argwhere(idx == least_idx)  # Need remove target date
+        idx = np.delete(idx, target_idx)            # to integrate Landsat-9
         temp_idx = np.argmin(np.abs(idx - least_idx))
         temp_len = len(idx)
         min_idx, max_idx = temp_idx - length // 2, temp_idx + length // 2
@@ -226,7 +304,7 @@ class DataLoader(data_utils.Dataset):
         idx = idx[min_idx:max_idx]
         # END
 
-        # # OPTION 2: 选择一整年的图像对
+        # # OPTION 2: ALL Images with Cloud Contamination In 1 Year
         # # START
         # date_ls = nc.num2date(landsat_dst.values, units=units,
         #                       calendar=calendar)
@@ -235,11 +313,16 @@ class DataLoader(data_utils.Dataset):
 
         # 目标日期的MODIS图像对
         time_modis = modis_dst['time']
+        season_idx_modis = filter_by_season(target_date, time_modis,
+                                            units, calendar, same_year=True)
+        while len(season_idx_modis) < 12:  # ~12 MODIS images in a specific season
+            season_idx_modis.append(season_idx_modis[-1] + 1)
         sidx, eidx = [np.argmin(np.abs(time_modis.values - x)) for x in
                       [time_landsat[idx[0]].values,
                        time_landsat[idx[-1]].values]]
 
-        return idx, (sidx, eidx)
+        # return idx, (sidx, eidx)
+        return np.array(season_idx_landsat)[idx], season_idx_modis
 
     def __getitem__(self, item):
         site_name = self.site_names[item]
@@ -251,8 +334,8 @@ class DataLoader(data_utils.Dataset):
         # doy = self.__get_date_encoding(input_files)
         landsat_file = os.path.join(landsat_path, site_name + ".nc")
         landsat_dst = xr.open_dataset(landsat_file)
-        sub_landsat = landsat_dst['data'][landsat_dst['sat'] == b"8"]
-        sub_mask = landsat_dst['mask'][landsat_dst['sat'] == b"8"]
+        sub_landsat = landsat_dst['data']  # [landsat_dst['sat'] == b"8"]
+        sub_mask = landsat_dst['mask']  # [landsat_dst['sat'] == b"8"]
 
         label_path = self.files[item]
         date = datetime.strptime(
@@ -268,7 +351,7 @@ class DataLoader(data_utils.Dataset):
         landsat_idx, modis_idx = self.__time_index(date, sub_landsat,
                                                    modis_dst_Q, sub_mask)
         if len(landsat_idx) < 2 * self.num_pairs:
-            print(site_name)
+            print(site_name, date)
         # 提取 landsat
         landsat = sub_landsat[landsat_idx].values.transpose(1, 0, 2, 3)  # ViT: 波段在前
         # imgs = input_dst['data'][idx].values.reshape(-1,  # reshape成三维给CNN网络用
@@ -276,14 +359,14 @@ class DataLoader(data_utils.Dataset):
         #                                              self.image_size)
         landsat = landsat / 65535.0
 
-        if self.MOD_idx is not None:
+        if self.MODIS:
             # 提取 mod09_q1
-            sub_modis_Q = modis_dst_Q['data'][self.MOD_idx[0]:self.MOD_idx[1]]
+            sub_modis_Q = modis_dst_Q['data'][modis_idx]
             modis_Q = sub_modis_Q.values.transpose(1, 0, 2, 3)
             modis_Q = modis_Q / 32768.0
             # 提取 mod09_a1
             modis_dst_A = xr.open_dataset(modis_file[1])
-            sub_modis_A = modis_dst_A['data'][self.MOD_idx[0]:self.MOD_idx[1]]
+            sub_modis_A = modis_dst_A['data'][modis_idx]
             modis_A = sub_modis_A.values.transpose(1, 0, 2, 3)
             modis_A = modis_A / 32768.0
 
@@ -326,7 +409,7 @@ class DataLoader(data_utils.Dataset):
 
         return {
             "landsat": landsat,
-            "modis_idx": modis_idx,
+            # "modis_idx": modis_idx,  # Max sequence for searching MODIS dynamically
             # "doy": torch.tensor(doy),
         }
 
@@ -343,10 +426,10 @@ def PSNRLoss(origin_img, predict_img, max_val=1.0):
         predict_img (ndarray): predict image.
         max_val (float, optional): max value of datatype. Defaults to 1.0.
     """
-    mse = F.mse_loss(origin_img, predict_img)
-    psnr = 10 * torch.log10(max_val ** 2 / mse)
+    mse = torch.mean((predict_img - origin_img) ** 2)
+    psnr = 20 * torch.log10(max_val / torch.sqrt(mse))
 
-    return psnr.item()
+    return psnr
 
 
 def filter_dataset(dataset):
@@ -370,7 +453,7 @@ def main():
     # label_dir = "/fossfs/skguan/data_fusion/rpt_labels"
     # ref_dir = "/fossfs/skguan/data_fusion/modis/sub_image/rpt_modis/MOD09A1"
     # sd = SplitDataset(label_dir, ref_dir)
-    # dst_path = "/fossfs/skguan/data_fusion/dataset_22_24_rpt.csv"
+    # dst_path = "/fossfs/skguan/data_fusion/dataset_23_rpt(s).csv"
     # sd.to_csv(dst_path)
 
     # # align dataset
@@ -379,11 +462,11 @@ def main():
     # align.align_dataset()
 
     # training configuration
-    category = "_vit(LMF)"
+    category = "_vit(SEASON_2Sat)"
     SECOND_TRAINING = False
     batch_size = 4  # *** hyper-param: batch size per iteration
-    num_pairs = 5  # *** hyper-param: number of images before and after target label
-    cloud_cover = 40  # *** hyper-param: maximum cloud cover
+    num_pairs = 6  # *** hyper-param: number of images before and after target label
+    cloud_cover = 60  # *** hyper-param: maximum cloud cover
     epochs = 200  # ** hyper-param: total training epoches
     warm_up = 10  # * hyper-param: warm_up epoches
     psnr_factor = 1  # ** hyper-param: psnr ratio for loss function
@@ -394,13 +477,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)
     landsat_path = "/lustre1/g/geog_geors/skguan/landsat"
-    modis_path = "/lustre1/g/geog_geors/skguan/modis/"
+    modis_path = "/lustre1/g/geog_geors/skguan/modis"
     label_path = "/lustre1/g/geog_geors/skguan/labels"
-    dataset_file = "/lustre1/g/geog_geors/skguan/dataset_22_24.csv"
+    dataset_file = "/lustre1/g/geog_geors/skguan/dataset_23(season)_num12.csv"
     df = pd.read_csv(dataset_file)
     train_files = df['train'].dropna().astype(str).to_list()
     train_files += df['val'].dropna().astype(str).to_list()
-    # train_files = filter_dataset(train_files)
+    # train_files = filter_dataset(train_files)[:19]
     test_files = df['test'].dropna().astype(str).to_list()
     # test_files = filter_dataset(test_files)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
@@ -420,21 +503,21 @@ def main():
                                                  shuffle=False)
 
         cgs = ComputeStats()
-        landsat_mean, landsat_std, MOD_idx = cgs.compute_global_stats(
+        landsat_mean, landsat_std = cgs.compute_global_stats(
             stats_dataloader, "landsat", channel_num=7
         )
-        print(MOD_idx)
+        # print(MOD_idx)
 
         # 计算当前fold的modis统计量
         stats_dataset = DataLoader(landsat_path, modis_path, label_path,
                                    fold_train_files, num_pairs=num_pairs,
-                                   cloud_cover=cloud_cover, MOD_idx=MOD_idx)
+                                   cloud_cover=cloud_cover, MODIS=True)
         stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
                                                  shuffle=False)
-        modisQ_mean, modisQ_std, _ = cgs.compute_global_stats(
+        modisQ_mean, modisQ_std = cgs.compute_global_stats(
             stats_dataloader, "modis_Q", channel_num=2
         )
-        modisA_mean, modisA_std, _ = cgs.compute_global_stats(
+        modisA_mean, modisA_std = cgs.compute_global_stats(
             stats_dataloader, "modis_A", channel_num=10
         )
         stats = {
@@ -451,7 +534,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
-            MOD_idx=MOD_idx
+            MODIS=True
         )
         train_dataloader = data_utils.DataLoader(
             train_dataset,
@@ -465,7 +548,7 @@ def main():
                 # torch.stack([x['doy'] for x in batch]),
             ),
             pin_memory=True,  # 加速CPU到GPU的数据传输
-            num_workers=4,  # 使用多进程加载数据
+            num_workers=6,  # 使用多进程加载数据
             persistent_workers=True
         )
 
@@ -477,7 +560,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
-            MOD_idx=MOD_idx
+            MODIS=True
         )
         valid_dataloader = data_utils.DataLoader(
             valid_dataset,
@@ -490,21 +573,23 @@ def main():
                 # torch.stack([x['doy'] for x in batch]),
             ),
             pin_memory=True,
-            num_workers=4,
+            num_workers=6,
             persistent_workers=True
         )
-        aux_steps = MOD_idx[1] - MOD_idx[0] + 1
+        aux_steps = 12   # Fixed steps for a specific season
         # model = SpatioTemporalViT(t_patch=2, patch_size=4, d_model=512)
         # model = ResNet(in_channels=42, out_channels=7)
         # model = UNet(in_channels=42, out_channels=7)
         model = ViT_Skip(main_steps=num_pairs * 2, main_spatch=16,
-                         main_tpatch=2, aux_steps=aux_steps, aux_spatch=4,
-                         aux_tpatch=2, aux_inchans=(2, 10), drop_rate=0.2,
-                         attn_drop_rate=0.1)
-        # model = SwinTransformer(img_size=256, time_steps=12, patch_size=16,
-        #                         t_patch=24, in_chans=7, embed_dim=96,
-        #                         depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24]
-        #                         window_size=(2, 4, 4), out_chans=7)
+                         main_tpatch=2, aux_steps=aux_steps, aux_spatch=2,
+                         aux_tpatch=1, aux_inchans=(2, 10), attn_drop_rate=0.1)
+        # model = SwinTransformer(main_steps=2 * num_pairs, main_spatch=4,
+        #                         main_tpatch=2, main_inchans=7, aux_size=18,
+        #                         aux_steps=aux_steps, aux_spatch=4, aux_tpatch=2,
+        #                         embed_dim=96, depths=[2, 2, 6, 2],
+        #                         num_heads=[3, 6, 12, 24], out_chans=7,
+        #                         window_sizes=[(2, 8, 8), (2, 8, 8),
+        #                                      (2, 4, 4), (2, 4, 4)])
 
         model.to(device)
         criterion = nn.MSELoss()
@@ -522,11 +607,12 @@ def main():
                     eta_min=1e-6
                 )
             ],
-            milestones=[warm_up * len(train_dataloader)]
+            milestones=[(warm_up) * len(train_dataloader)]
         )
 
         best_r2 = -np.inf
-        best_psnr = -np.inf
+        best_psnr = -np.inf  # for validation process
+        temp_psnr = -np.inf  # for training process
         metrics_dict = {'train_loss': [], 'train_r2': [], 'train_rmse': [],
                         'train_psnr': [], 'train_ssim': [],
                         'valid_loss': [], 'valid_r2': [], 'valid_rmse': [],
@@ -596,6 +682,9 @@ def main():
             train_ssim = ssim(label_list, pred_list, data_range=1)
             metrics_dict['train_psnr'].append(train_psnr)
             metrics_dict['train_ssim'].append(train_ssim)
+            if train_psnr > temp_psnr:
+                np.savez(f"train_result_fold{fold_idx}{category}.npz",
+                         label_list[:30], pred_list[:30])
             label_list = label_list.reshape(-1,)
             pred_list = pred_list.reshape(-1,)
             train_r2 = r2(label_list, pred_list)
@@ -629,9 +718,8 @@ def main():
 
                         loss_metric_val += valid_loss.item()
                         count += 1
-                        if count <= 30:
-                            label_list.append(valid_label.cpu().detach().numpy())
-                            pred_list.append(valid_logits.cpu().detach().numpy())
+                        label_list.append(valid_label.cpu().detach().numpy())
+                        pred_list.append(valid_logits.cpu().detach().numpy())
 
                         del valid_landsat, valid_modisQ, valid_modisA,
                         del valid_label, valid_logits
@@ -645,7 +733,7 @@ def main():
                 metrics_dict['valid_ssim'].append(valid_ssim)
                 if valid_psnr > best_psnr:
                     np.savez(f"val_result_fold{fold_idx}{category}.npz",
-                             label_list, pred_list)
+                             label_list[:30], pred_list[:30])
                 label_list = label_list.reshape(-1,)
                 pred_list = pred_list.reshape(-1,)
                 valid_r2 = r2(label_list, pred_list)
@@ -686,7 +774,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
-            MOD_idx=MOD_idx
+            MODIS=True
         )
         test_dataloader = data_utils.DataLoader(
             test_dataset,
@@ -700,7 +788,7 @@ def main():
                 # torch.stack([x['doy'] for x in batch]),
             ),
             pin_memory=True,
-            num_workers=4,
+            num_workers=6,
             persistent_workers=True
         )
         check_point = torch.load(f"checkpoint_fold{fold_idx}{category}.pth")
@@ -726,9 +814,8 @@ def main():
 
                 loss_metric_test += test_loss.item()
                 count += 1
-                if count <= 30:
-                    label_list.append(test_label.cpu().detach().numpy())
-                    pred_list.append(test_logits.cpu().detach().numpy())
+                label_list.append(test_label.cpu().detach().numpy())
+                pred_list.append(test_logits.cpu().detach().numpy())
 
                 del test_landsat, test_modisQ, test_modisA
                 del test_label, test_logits
@@ -741,7 +828,7 @@ def main():
         test_psnr = psnr(label_list, pred_list, data_range=1)
         test_ssim = ssim(label_list, pred_list, data_range=1)
         np.savez(f"test_result_fold{fold_idx}{category}.npz",
-                 label_list, pred_list)
+                 label_list[:30], pred_list[:30])
         label_list_all = label_list.reshape(-1,)
         pred_list_all = pred_list.reshape(-1,)
         test_r2 = r2(label_list_all, pred_list_all)

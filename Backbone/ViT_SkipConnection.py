@@ -370,6 +370,8 @@ class Decoder(nn.Module):
                 prev_feat = self.cross_scale_fusion[i](prev_feat)
                 skip_feat = skip_feat + prev_feat
 
+                del prev_feat
+
             _, _, _, current_h, current_w = x.shape
             skip_feat = F.interpolate(skip_feat,
                                       size=(t_blk, current_h, current_w),
@@ -384,6 +386,7 @@ class Decoder(nn.Module):
         # x = self.final_up(x)
         x = self.conv(x)
         x = x.mean(dim=2)
+        x = x[:, :, :H, :W]
 
         return self.sigmoid(x)
 
@@ -613,6 +616,7 @@ class ViT_Skip(nn.Module):
             x = x + self.pos_embed
         x = self.pos_drop(x)
         x1 = self.info_merge(x1, x2)
+        del x2
         for i, (main_blk, aux_blk, cnn_blk) in enumerate(zip(
             self.main_blocks, self.aux_blocks, self.cnn_blocks
         )):

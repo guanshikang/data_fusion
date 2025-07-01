@@ -61,22 +61,40 @@ class PatchMerging3D(nn.Module):
             self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
             self.norm = norm_layer(4 * dim)
 
-    def forward(self, x, t_blk, h_blk, w_blk):
+    def forward(self, x):
         """
         x: B, T, H, W, C
         """
         B, T, H, W, C = x.shape
-
+        pad_input = (H % 2 == 1) or (W % 2 == 1) or \
+            (self.temporal_merge and T % 2 == 1)
+        if pad_input:
+            pad_t = 2 - (T % 2) if self.temporal_merge and T % 2 != 0 else 0
+            x = F.pad(x, (0, 0, 0, W % 2, 0, H % 2, 0, pad_t))
+            T += pad_t
+            H += H % 2
+            W += W % 2
         if self.temporal_merge:
-            x = x.view(B, T // 2, 2, H // 2, 2, W // 2, 2, C)
-            x = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
-            x = x.view(B, T // 2, H // 2, W // 2, 8 * C)
-            t_blk, h_blk, w_blk = T // 2, H // 2, W // 2
+            x000 = x[:, 0::2, 0::2, 0::2, :]  # B, T // 2, H // 2, W // 2, C
+            x001 = x[:, 0::2, 0::2, 1::2, :]
+            x010 = x[:, 0::2, 1::2, 0::2, :]
+            x011 = x[:, 0::2, 1::2, 1::2, :]
+            x100 = x[:, 1::2, 0::2, 0::2, :]
+            x101 = x[:, 1::2, 0::2, 1::2, :]
+            x110 = x[:, 1::2, 1::2, 0::2, :]
+            x111 = x[:, 1::2, 1::2, 1::2, :]
+            x = torch.cat([x000, x001, x010, x011, x100, x101, x110, x111], -1)
+            t_blk = T // 2
         else:
-            x = x.view(B, T, H // 2, 2, W // 2, 2, C)
-            x = x.permute(0, 1, 2, 4, 3, 5, 6).contiguous()
-            x = x.view(B, T, H // 2, W // 2, 4 * C)
-            h_blk, w_blk = H // 2, W // 2
+            x0 = x[:, :, 0::2, 0::2, :]  # B T H/2 W/2 C
+            x1 = x[:, :, 0::2, 1::2, :]  # B T H/2 W/2 C
+            x2 = x[:, :, 1::2, 0::2, :]  # B T H/2 W/2 C
+            x3 = x[:, :, 1::2, 1::2, :]  # B T H/2 W/2 C
+            x = torch.cat([x0, x1, x2, x3], -1)  # B T H/2 W/2 4*C
+            t_blk = T // 1
+
+        h_blk = H // 2
+        w_blk = W // 2
 
         x = self.norm(x)
         x = self.reduction(x)
@@ -435,10 +453,12 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, main_x, aux_x, t_blk, h_blk, w_blk):
-        T, H, W = self.input_resolution
+    def forward(self, main_x, aux_x):
+        T, H, W = self.main_resolution
         B, L, C = main_x.shape
-        assert L == T * H * W, "Input feature has wrong size."
+        t, h, w = self.aux_resolution
+        b, l, c = aux_x.shape
+        assert (L == T * H * W) & (l == t * h * w), "Input feature has wrong size."
 
         # Process through transformer blocks
         for i in range(self.depth):
@@ -454,15 +474,14 @@ class BasicLayer(nn.Module):
         if self.downsample is not None:
             # Reshape to 3D format for merging
             main_3d = main_x.view(B, T, H, W, -1)
-            main_x, t_blk, h_blk, w_blk = self.downsample(main_3d,
-                                                          t_blk,
-                                                          h_blk,
-                                                          w_blk)
+            main_x, t_blk, h_blk, w_blk = self.downsample(main_3d)
             main_x = main_x.view(B, -1, main_x.shape[-1])  # Flatten to (B, N, C)
 
-            aux_3d = aux_x.view(B, T, H, W, -1)
-            aux_x, _, _, _ = self.downsample(aux_3d, t_blk, h_blk, w_blk)
+            aux_3d = aux_x.view(B, t, h, w, -1)
+            aux_x, _, _, _ = self.downsample(aux_3d)
             aux_x = aux_x.view(B, -1, aux_x.shape[-1])
+        else:
+            t_blk, h_blk, w_blk = T, H, W
 
         return main_x, aux_x, t_blk, h_blk, w_blk
 
@@ -657,22 +676,43 @@ class SpatialDownScale(nn.Module):
         return x
 
 
-class InformationMerge(nn.Module):
-    def __init__(self, img_size=18, time_steps=136, patch_size=16, t_patch=2,
-                 in_channels=(2, 10), embed_dim=768):
+class SpatialUpScale(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.double_conv = SpatialDownScale(in_channels[0], 4 * in_channels[0])
-        self.in_channels = 4 * in_channels[0] + in_channels[1]  # !
+        self.double_conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU(),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU()
+        )
+        self.up_scale = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear',
+                                    align_corners=True)
+
+    def forward(self, x):
+        x = self.up_scale(x)
+        x = self.double_conv(x)
+
+        return x
+
+
+class InformationMerge(nn.Module):
+    def __init__(self, img_size=18, time_steps=12, patch_size=4, t_patch=2,
+                 in_channels=(2, 10), embed_dim=96):
+        super().__init__()
+        self.up_scale = SpatialUpScale(in_channels[1], 4 * in_channels[1])
+        self.in_channels = 4 * in_channels[1] + in_channels[0]  # !
         self.patch_embed = PatchEmbed3D(img_size, time_steps, patch_size,
                                         t_patch, self.in_channels, embed_dim)
         self.num_patches = self.patch_embed.num_patches
 
     def forward(self, x1, x2):
-        x1 = self.double_conv(x1)
+        x2 = self.up_scale(x2)
         x = torch.cat([x1, x2], dim=1)
-        x, _ = self.patch_embed(x)
+        x, aux_thw = self.patch_embed(x)
 
-        return x
+        return x, aux_thw
 
 
 class FeatureFusion(nn.Module):
@@ -708,7 +748,7 @@ class FeatureFusion(nn.Module):
 
 class SwinTransformer(nn.Module):
     def __init__(self, main_size=256, main_steps=12, main_spatch=4,
-                 main_tpatch=2, main_inchans=7, aux_size=18, aux_steps=136,
+                 main_tpatch=2, main_inchans=7, aux_size=36, aux_steps=12,
                  aux_spatch=4, aux_tpatch=2, aux_inchans=(2, 10),
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0.,
@@ -764,10 +804,15 @@ class SwinTransformer(nn.Module):
 
             # Update resolution for next stage
             if temporal_merges[i]:
-                t_blk //= 2
-            h_blk //= 2
-            w_blk //= 2
-            self.main_resolution = (t_blk, h_blk, w_blk)
+                main_tblk //= 2
+            main_hblk //= 2
+            main_wblk //= 2
+            self.main_resolution = (main_tblk, main_hblk, main_wblk)
+            if temporal_merges[i]:
+                aux_tblk //= 2
+            aux_hblk //= 2
+            aux_wblk //= 2
+            self.aux_resolution = (aux_tblk, aux_hblk, aux_wblk)
 
         # CNN Enhance Module
         self.cnn_enhance = nn.ModuleList([
@@ -793,7 +838,6 @@ class SwinTransformer(nn.Module):
         self.encoder_features = []
         original_shape = x.shape
         x, main_thw =  self.main_patch_embed(x)
-        t_blk, h_blk, w_blk = main_thw
         B, T, H, W, C = x.shape
         x = x.view(B, -1, C)  # Flatten to (B, N, C)
 
@@ -801,16 +845,16 @@ class SwinTransformer(nn.Module):
         self.encoder_features.append(x.view(B, T, H, W, C).clone())
 
         # Process Auxiliary Branch
-        x1 = self.info_merge(x1, x2)
+        x1, aux_thw = self.info_merge(x1, x2)
         x1 = x1.view(B, -1, C)
 
         # Process through hierarchical stages
         for i, stage in enumerate(self.stages):
             # Apply Swin Transformer Stage
-            x, x1, t_blk, h_blk, w_blk = stage(x, x1, t_blk, h_blk, w_blk)
+            x, x1, t_blk, h_blk, w_blk = stage(x, x1)
 
             # Apply CNN enhancement at specific stages
-            if i in [3, 6, 9]:
+            if i in [1, 2, 3]:
                 # Convert to 3D for CNN Processing
                 x_3d = x.view(B, t_blk, h_blk, w_blk, -1).permute(0, 4, 1, 2, 3)
                 cnn_feature = self.cnn_enhance[i](x_3d)

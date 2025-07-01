@@ -35,6 +35,7 @@ import torch.nn.functional as F
 import torch.utils.data as data_utils
 from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.cuda.amp import autocast
 
 from FunctionalCode.CommonFuncs import CommonFuncs
 from FunctionalCode.GlobalStats import ComputeStats
@@ -162,7 +163,7 @@ class AlignDataset:
             for date in date_series:
                 output_name = re.match("\\w+_\\d{6}_", ref_img).group()
                 output_name += "%s_padding.tif" % date
-                data = np.full((7, 256, 256), -.2, np.float32)
+                data = np.full((7, 256, 256), -0.2, np.float32)
                 self.cf.save_image(ref_img, output_name, data)
                 print("{} in {} is Copied!".format(date, site))
 
@@ -176,7 +177,7 @@ class DataLoader(data_utils.Dataset):
     """
     def __init__(self, landsat_path, modis_path, label_path, files,
                  out_channels=7, image_size=256, num_pairs=3, cloud_cover=30,
-                 stats=None, MODIS=False):
+                 stats=None, Landsat=None, MODIS=False):
         self.landsat_path = landsat_path
         self.modis_path = modis_path
         self.label_path = label_path
@@ -188,6 +189,7 @@ class DataLoader(data_utils.Dataset):
         self.site_names = self.__get_sitenames()
         self.stats = stats
         self.standardizable = stats is not None
+        self.Landsat = Landsat or "Single"
         self.MODIS = MODIS
 
     def __get_sitenames(self):
@@ -289,6 +291,8 @@ class DataLoader(data_utils.Dataset):
         idx = np.array(idx)
         if len(idx) == 0:
             return [], []
+        target_idx = np.argwhere(idx == least_idx)
+        idx = np.delete(idx, target_idx)
         temp_idx = np.argmin(np.abs(idx - least_idx))
         temp_len = len(idx)
         min_idx, max_idx = temp_idx - length // 2, temp_idx + length // 2
@@ -312,7 +316,7 @@ class DataLoader(data_utils.Dataset):
         time_modis = modis_dst['time']
         season_idx_modis = filter_by_season(target_date, time_modis,
                                             units, calendar, same_year=True)
-        if len(season_idx_modis) < 4 * self.num_pairs:
+        while len(season_idx_modis) < 12:  # ~12 MODIS images for a specific season
             season_idx_modis.append(season_idx_modis[-1] + 1)
         sidx, eidx = [np.argmin(np.abs(time_modis.values - x)) for x in
                       [time_landsat[idx[0]].values,
@@ -331,8 +335,11 @@ class DataLoader(data_utils.Dataset):
         # doy = self.__get_date_encoding(input_files)
         landsat_file = os.path.join(landsat_path, site_name + ".nc")
         landsat_dst = xr.open_dataset(landsat_file)
-        sub_landsat = landsat_dst['data'][landsat_dst['sat'] == b"8"]
-        sub_mask = landsat_dst['mask'][landsat_dst['sat'] == b"8"]
+        sub_landsat = landsat_dst['data']
+        sub_mask = landsat_dst['mask']
+        if self.Landsat == "Union":
+            sub_landsat = sub_landsat[landsat_dst['sat'] == b"8"]
+            sub_mask = sub_mask[landsat_dst['sat'] == b"8"]
 
         label_path = self.files[item]
         date = datetime.strptime(
@@ -459,7 +466,7 @@ def main():
     # align.align_dataset()
 
     # training configuration
-    category = "_vit(SEASON3)"
+    category = "_vitL(SEASON)"
     SECOND_TRAINING = False
     batch_size = 4  # *** hyper-param: batch size per iteration
     num_pairs = 3  # *** hyper-param: number of images before and after target label
@@ -469,20 +476,21 @@ def main():
     psnr_factor = 1  # ** hyper-param: psnr ratio for loss function
     lr = 3e-5  # *** hyper-parm: initialized learning rate
     accumulation_steps = 2  # *** hyper-parm: avoid cuda out of memory
+    Landsat = "Single"  # use what kind of landsat data
     n_splits = 5
     start_epoch = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)
-    landsat_path = "/fossfs/skguan/data_fusion/landsat"
-    modis_path = "/fossfs/skguan/data_fusion/modis/sub_image/"
-    label_path = "/fossfs/skguan/data_fusion/labels"
-    dataset_file = "/fossfs/skguan/data_fusion/split_dataset/dataset_23(season).csv"
+    landsat_path = "/fossfs/skguan/data_fusion/rpt_landsat"
+    modis_path = "/fossfs/skguan/data_fusion/modis/sub_image/rpt_modis"
+    label_path = "/fossfs/skguan/data_fusion/rpt_labels"
+    dataset_file = "/fossfs/skguan/data_fusion/split_dataset/dataset_23_rpt(season)_num6.csv"
     df = pd.read_csv(dataset_file)
     train_files = df['train'].dropna().astype(str).to_list()
     train_files += df['val'].dropna().astype(str).to_list()
-    # train_files = filter_dataset(train_files)[:19]
+    train_files = filter_dataset(train_files)[:19]
     test_files = df['test'].dropna().astype(str).to_list()
-    # test_files = filter_dataset(test_files)
+    test_files = filter_dataset(test_files)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_metrics = []
 
@@ -495,7 +503,7 @@ def main():
         # 计算当前fold的landsat统计量
         stats_dataset = DataLoader(landsat_path, modis_path, label_path,
                                    fold_train_files, num_pairs=num_pairs,
-                                   cloud_cover=cloud_cover)
+                                   cloud_cover=cloud_cover, Landsat=Landsat)
         stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
                                                  shuffle=False)
 
@@ -508,7 +516,8 @@ def main():
         # 计算当前fold的modis统计量
         stats_dataset = DataLoader(landsat_path, modis_path, label_path,
                                    fold_train_files, num_pairs=num_pairs,
-                                   cloud_cover=cloud_cover, MODIS=True)
+                                   cloud_cover=cloud_cover, Landsat=Landsat,
+                                   MODIS=True)
         stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
                                                  shuffle=False)
         modisQ_mean, modisQ_std = cgs.compute_global_stats(
@@ -531,6 +540,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         train_dataloader = data_utils.DataLoader(
@@ -557,6 +567,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         valid_dataloader = data_utils.DataLoader(
@@ -573,20 +584,21 @@ def main():
             num_workers=6,
             persistent_workers=True
         )
-        aux_steps = 4 * num_pairs
+        aux_steps = 12  # Fixed MODIS steps for a specific season
         # model = SpatioTemporalViT(t_patch=2, patch_size=4, d_model=512)
         # model = ResNet(in_channels=42, out_channels=7)
         # model = UNet(in_channels=42, out_channels=7)
-        # model = ViT_Skip(main_steps=num_pairs * 2, main_spatch=16,
+        # model = ViT_Skip(main_steps=num_pairs * 2, main_spatch=14,
         #                  main_tpatch=2, aux_steps=aux_steps, aux_spatch=2,
-        #                  aux_tpatch=1, aux_inchans=(2, 10), attn_drop_rate=0.1)
+        #                  aux_tpatch=1, aux_inchans=(2, 10), attn_drop_rate=0.1,
+        #                  embed_dim=1024, depth=24, num_heads=16, depth_wise=[6, 12, 18])
         model = SwinTransformer(main_steps=2 * num_pairs, main_spatch=4,
                                 main_tpatch=2, main_inchans=7, aux_size=18,
-                                aux_steps=aux_steps, aux_spatch=4, aux_tpatch=2,
+                                aux_steps=aux_steps, aux_spatch=2, aux_tpatch=2,
                                 embed_dim=96, depths=[2, 2, 6, 2],
                                 num_heads=[3, 6, 12, 24], out_chans=7,
                                 window_sizes=[(2, 8, 8), (2, 8, 8),
-                                             (2, 4, 4), (2, 4, 4)])
+                                              (2, 4, 4), (2, 4, 4)])
 
         model.to(device)
         criterion = nn.MSELoss()
@@ -646,7 +658,6 @@ def main():
                 train_modisA = train_modisA.to(device, non_blocking=True)
                 train_label = train_label.to(device, non_blocking=True)
                 # doy = doy.to(device)
-
                 train_logits = model(train_landsat, train_modisQ, train_modisA)
                 psnr_loss = PSNRLoss(train_logits, train_label)
                 mse_loss = criterion.forward(train_logits, train_label)
@@ -708,7 +719,7 @@ def main():
                         # doy = doy.to(device)
 
                         valid_logits = model(valid_landsat, valid_modisQ,
-                                             valid_modisA)
+                                                valid_modisA)
                         psnr_loss = PSNRLoss(valid_logits, valid_label)
                         mse_loss = criterion.forward(valid_logits, valid_label)
                         valid_loss = mse_loss + psnr_factor * (1 / psnr_loss)
@@ -771,6 +782,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         test_dataloader = data_utils.DataLoader(
