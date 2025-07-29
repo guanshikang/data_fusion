@@ -568,36 +568,13 @@ class Decoder(nn.Module):
         super().__init__()
         self.t_patch = t_patch
         self.patch_size = patch_size
-        self.reassemble = nn.Sequential(
-            nn.Linear(embed_dim, 1024),
-            nn.GELU()
-        )
-        # Updated skip features to match hierarchical structure
-        self.skip_features = [1024, 512, 256, 128]
-        self.skip_fuse = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv3d(skip_dim, skip_dim,
-                          kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-                nn.BatchNorm3d(skip_dim),
-                nn.GELU(),
-                nn.Conv3d(skip_dim, skip_dim // 8, kernel_size=1),
-                nn.GELU(),
-                nn.Conv3d(skip_dim // 8, skip_dim, kernel_size=1),
-                nn.Sigmoid(),
-                nn.Conv3d(skip_dim, skip_target, kernel_size=1),
-                nn.BatchNorm3d(skip_target),
-                nn.GELU()
-            ) for skip_dim, skip_target in zip(skip_dims, self.skip_features)
-        ])
+        self.skip_features = skip_dims[::-1]
 
         self.residule_up = nn.ModuleList([
             ResiduleUpBlock(in_ch, out_ch)
             for in_ch, out_ch in zip(
-                [1024 + self.skip_features[0],
-                 512 + self.skip_features[1],
-                 256 + self.skip_features[2],
-                 128 + self.skip_features[3]],
-                [512, 256, 128, 64])
+                [x * 2 for x in self.skip_features],
+                [x // 2 for x in self.skip_features])
         ])
         self.feature_fusion_attn = nn.ModuleList([
             nn.Sequential(
@@ -607,18 +584,22 @@ class Decoder(nn.Module):
                 nn.Sigmoid()
             ) for skip_target in self.skip_features
         ])
-        self.cross_scale_fusion = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv3d(feat_dim, feat_dim // 2, kernel_size=1),
-                nn.GELU(),
-                nn.Conv3d(feat_dim // 2, feat_dim, kernel_size=1)
-            ) for feat_dim in skip_dims
-        ])
 
-        self.conv = nn.Conv3d(64, out_chans,
-                              kernel_size=(3, 1, 1),
-                              stride=(2, 1, 1),
-                              padding=(1, 0, 0))
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose3d(
+                48, 32,
+                kernel_size=(4, 4, 4),
+                stride=(2, 2, 2),
+                padding=(1, 1, 1)
+            ),
+            nn.BatchNorm3d(32),
+            nn.GELU()
+        )
+
+        self.conv = nn.Conv3d(32, out_chans,
+                              kernel_size=(1, 1, 1),
+                              stride=(1, 1, 1),
+                              padding=(0, 0, 0))
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, original_shape, thw_blocks, encoder_features):
@@ -626,31 +607,23 @@ class Decoder(nn.Module):
         _, _, T, H, W = original_shape
 
         t_blk, h_blk, w_blk = thw_blocks
-        x = self.reassemble(x)
         x = x.view(B, t_blk, h_blk, w_blk, -1)
         x = x.permute(0, 4, 1, 2, 3)  # (B, C, t_blk, h_blk, w_blk)
-
         # Process hierarchical features
         for i, (up_block, skip_feat) in enumerate(zip(self.residule_up,
                                                       encoder_features)):
             # Skip features are already in 3D format
             skip_feat = skip_feat.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
 
-            if i > 0:
-                prev_feat = encoder_features[i - 1].permute(0, 4, 1, 2, 3)
-                prev_feat = self.cross_scale_fusion[i](prev_feat)
-                skip_feat = skip_feat + prev_feat
-
             _, _, _, current_h, current_w = x.shape
             skip_feat = F.interpolate(skip_feat,
                                       size=(t_blk, current_h, current_w),
                                       mode='trilinear')
-            skip_feat = self.skip_fuse[i](skip_feat)
             skip_feat = skip_feat * self.feature_fusion_attn[i](skip_feat)
 
             x = torch.cat([x, skip_feat], dim=1)
             x = up_block(x, skip=None)
-
+        x = self.final_up(x)
         x = self.conv(x)
         x = x.mean(dim=2)
 
@@ -780,7 +753,7 @@ class SwinTransformer(nn.Module):
 
         # Output dimensions per stage
         out_dims = [embed_dim, embed_dim * 2, embed_dim * 4, embed_dim * 8]
-        temporal_merges = [False, True, False, False]  # Whether to merge temporal dimension
+        temporal_merges = [False, False, False, False]  # Whether to merge temporal dimension
 
         # Build Stages
         for i in range(len(depths)):
@@ -804,32 +777,44 @@ class SwinTransformer(nn.Module):
 
             # Update resolution for next stage
             if temporal_merges[i]:
+                main_tblk += main_tblk % 2
                 main_tblk //= 2
+            main_hblk += main_tblk % 2
             main_hblk //= 2
+            main_wblk += main_wblk % 2
             main_wblk //= 2
             self.main_resolution = (main_tblk, main_hblk, main_wblk)
             if temporal_merges[i]:
+                aux_tblk += aux_tblk % 2
                 aux_tblk //= 2
+            aux_hblk += aux_hblk % 2
             aux_hblk //= 2
+            aux_wblk += aux_wblk % 2
             aux_wblk //= 2
             self.aux_resolution = (aux_tblk, aux_hblk, aux_wblk)
 
         # CNN Enhance Module
+        dims = [embed_dim * 2, embed_dim * 4, embed_dim * 8, embed_dim * 8]
         self.cnn_enhance = nn.ModuleList([
-            CNNFeatureEnhancement(out_dims[i]) for i in range(len(depths))
+            CNNFeatureEnhancement(dims[i]) for i in range(len(depths))
         ])
         self.fusion_gates = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 4),
+                nn.Linear(dims[i], dims[i] // 4),
                 nn.GELU(),
-                nn.Linear(embed_dim // 4, 1),
+                nn.Linear(dims[i] // 4, 1),
                 nn.Sigmoid()
-            ) for _ in range(len(depths))
+            ) for i in range(len(depths))
         ])
 
         self.info_merge = InformationMerge(
             aux_size, aux_steps, aux_spatch, aux_tpatch, aux_inchans, embed_dim
         )
+
+        self.feature_fusion = nn.ModuleList([
+            FeatureFusion(main_dim=dims[i], aux_dim=dims[i], out_dim=dims[i])
+            for i in range(len(depths))
+        ])
         # Image Reconstrcution
         self.decoder = Decoder(out_dims[-1], main_size, main_tpatch,
                                main_spatch, out_chans, skip_dims=out_dims)
@@ -837,7 +822,7 @@ class SwinTransformer(nn.Module):
     def forward(self, x, x1, x2):
         self.encoder_features = []
         original_shape = x.shape
-        x, main_thw =  self.main_patch_embed(x)
+        x, _ =  self.main_patch_embed(x)
         B, T, H, W, C = x.shape
         x = x.view(B, -1, C)  # Flatten to (B, N, C)
 
@@ -845,16 +830,16 @@ class SwinTransformer(nn.Module):
         self.encoder_features.append(x.view(B, T, H, W, C).clone())
 
         # Process Auxiliary Branch
-        x1, aux_thw = self.info_merge(x1, x2)
+        x1, _ = self.info_merge(x1, x2)
         x1 = x1.view(B, -1, C)
 
         # Process through hierarchical stages
         for i, stage in enumerate(self.stages):
             # Apply Swin Transformer Stage
             x, x1, t_blk, h_blk, w_blk = stage(x, x1)
-
+            x = self.feature_fusion[i](x, x1)
             # Apply CNN enhancement at specific stages
-            if i in [1, 2, 3]:
+            if i in [0, 1, 2]:
                 # Convert to 3D for CNN Processing
                 x_3d = x.view(B, t_blk, h_blk, w_blk, -1).permute(0, 4, 1, 2, 3)
                 cnn_feature = self.cnn_enhance[i](x_3d)
@@ -866,10 +851,12 @@ class SwinTransformer(nn.Module):
                     B, -1, cnn_feature.shape[-1])
 
                 x = fused_feature
+                # self.encoder_features.append(x_3d.permute(0, 2, 3, 4, 1).contiguous().
+                                            #  view(B, t_blk, h_blk, w_blk, -1))
                 self.encoder_features.append(fused_feature.view(B, t_blk, h_blk,
                                                                 w_blk, -1))
 
         x = self.decoder(x.view(B, -1, x.shape[-1]), original_shape,
-                         (t_blk, h_blk, w_blk), self.encoder_features)
+                         (t_blk, h_blk, w_blk), self.encoder_features[::-1])
 
         return x

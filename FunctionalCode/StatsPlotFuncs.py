@@ -4,7 +4,7 @@
 
 @author: guanshikang
 
-@type: script
+@type: class
 
 Created on Mon Mar 24 10:13:10 2025, HONG KONG
 
@@ -89,8 +89,8 @@ class StatsPlot:
         ax.plot(x, regression_line, c='k', ls='-', lw=1)
         ax.axis([0, 1, 0, 1])
 
-        ax.set_xlabel("Observed Refelctance")
-        ax.set_ylabel("Estimated Reflectance")
+        ax.set_xlabel("Real Refelctance")
+        ax.set_ylabel("Predicted Reflectance")
         ax.set_xticks(np.arange(0, 1 + 1e-8, 0.2))
         ax.set_yticks(np.arange(0, 1 + 1e-8, 0.2))
         ax.tick_params(
@@ -102,11 +102,11 @@ class StatsPlot:
             top=True
         )
 
-        ax.text(0.2, 0.85, r"$\rm N=%d$" % len(y), fontsize=28, transform=ax.transAxes)
-        ax.text(0.2, 0.80, r"$\rm Y=%.2fX+%.2f$" % (k, b), fontsize=28, transform=ax.transAxes)
-        ax.text(0.2, 0.75, r"$\rm R^2=%.2f$" % float(R2), fontsize=28, transform=ax.transAxes)
-        ax.text(0.2, 0.70, r"$\rm RMSE=%.2f$" % float(RMSE), fontsize=28, transform=ax.transAxes)
-        ax.text(0.2, 0.65, r"$\rm MAE=%.2f$" % float(MAE), fontsize=28, transform=ax.transAxes)
+        # ax.text(0.2, 0.85, r"$\rm N=%d$" % len(y), fontsize=28, transform=ax.transAxes)
+        # ax.text(0.2, 0.80, r"$\rm Y=%.2fX+%.2f$" % (k, b), fontsize=28, transform=ax.transAxes)
+        # ax.text(0.2, 0.75, r"$\rm R^2=%.2f$" % float(R2), fontsize=28, transform=ax.transAxes)
+        # ax.text(0.2, 0.70, r"$\rm RMSE=%.2f$" % float(RMSE), fontsize=28, transform=ax.transAxes)
+        # ax.text(0.2, 0.65, r"$\rm MAE=%.2f$" % float(MAE), fontsize=28, transform=ax.transAxes)
 
         file_name = file_name if file_name is not None else "scatter_density.png"
         save_path = os.path.join(self.save_dir, file_name)

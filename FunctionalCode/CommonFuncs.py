@@ -4,7 +4,7 @@
 
 @author: guanshikang
 
-@type: script
+@type: class
 
 Created on Wed Jan 08 15:17:06 2025, HONG KONG
 """

@@ -163,7 +163,7 @@ class AlignDataset:
             for date in date_series:
                 output_name = re.match("\\w+_\\d{6}_", ref_img).group()
                 output_name += "%s_padding.tif" % date
-                data = np.full((7, 256, 256), -.2, np.float32)
+                data = np.full((7, 256, 256), -0.2, np.float32)
                 self.cf.save_image(ref_img, output_name, data)
                 print("{} in {} is Copied!".format(date, site))
 
@@ -177,7 +177,7 @@ class DataLoader(data_utils.Dataset):
     """
     def __init__(self, landsat_path, modis_path, label_path, files,
                  out_channels=7, image_size=256, num_pairs=3, cloud_cover=30,
-                 stats=None, MODIS=False):
+                 stats=None, Landsat=None, MODIS=False):
         self.landsat_path = landsat_path
         self.modis_path = modis_path
         self.label_path = label_path
@@ -189,13 +189,14 @@ class DataLoader(data_utils.Dataset):
         self.site_names = self.__get_sitenames()
         self.stats = stats
         self.standardizable = stats is not None
+        self.Landsat = Landsat or "Single"
         self.MODIS = MODIS
 
     def __get_sitenames(self):
         return [x.split("/")[-2] for x in self.files]
 
     def __standardization(self, data, flag):
-        data = np.where(data < 0, np.nan, data)
+        data = np.where(data < -1.0, np.nan, data)
         if flag == "label":
             pass
         else:
@@ -290,8 +291,8 @@ class DataLoader(data_utils.Dataset):
         idx = np.array(idx)
         if len(idx) == 0:
             return [], []
-        target_idx = np.argwhere(idx == least_idx)  # Need remove target date
-        idx = np.delete(idx, target_idx)            # to integrate Landsat-9
+        target_idx = np.argwhere(idx == least_idx)
+        idx = np.delete(idx, target_idx)
         temp_idx = np.argmin(np.abs(idx - least_idx))
         temp_len = len(idx)
         min_idx, max_idx = temp_idx - length // 2, temp_idx + length // 2
@@ -315,7 +316,7 @@ class DataLoader(data_utils.Dataset):
         time_modis = modis_dst['time']
         season_idx_modis = filter_by_season(target_date, time_modis,
                                             units, calendar, same_year=True)
-        while len(season_idx_modis) < 12:  # ~12 MODIS images in a specific season
+        while len(season_idx_modis) < 12:  # ~12 MODIS images for a specific season
             season_idx_modis.append(season_idx_modis[-1] + 1)
         sidx, eidx = [np.argmin(np.abs(time_modis.values - x)) for x in
                       [time_landsat[idx[0]].values,
@@ -334,8 +335,14 @@ class DataLoader(data_utils.Dataset):
         # doy = self.__get_date_encoding(input_files)
         landsat_file = os.path.join(landsat_path, site_name + ".nc")
         landsat_dst = xr.open_dataset(landsat_file)
-        sub_landsat = landsat_dst['data']  # [landsat_dst['sat'] == b"8"]
-        sub_mask = landsat_dst['mask']  # [landsat_dst['sat'] == b"8"]
+        if self.Landsat == "Single":
+            sub_landsat = landsat_dst['data'][landsat_dst['sat'] == b"8"]
+            sub_mask = landsat_dst['mask'][landsat_dst['sat'] == b"8"]
+        elif self.Landsat == "Union":
+            sub_landsat = landsat_dst['data']
+            sub_mask = landsat_dst['mask']
+        else:
+            raise ValueError("Type of Landsat data should be pointed out!")
 
         label_path = self.files[item]
         date = datetime.strptime(
@@ -358,7 +365,13 @@ class DataLoader(data_utils.Dataset):
         #                                              self.image_size,
         #                                              self.image_size)
         landsat = landsat / 65535.0
-
+        band_order = [1, 2, 3, 4, 5, 6]
+        # band_order = [1, 2, 3, 4]
+        landsat = landsat[band_order, ...]
+        label = self.__load_tiff([label_path], "label")
+        band_order = [1]
+        label = label[band_order, ...]
+        # label = np.where(label <= 1.0, 65455.0, label)  # !!!!!!!!!
         if self.MODIS:
             # 提取 mod09_q1
             sub_modis_Q = modis_dst_Q['data'][modis_idx]
@@ -369,6 +382,9 @@ class DataLoader(data_utils.Dataset):
             sub_modis_A = modis_dst_A['data'][modis_idx]
             modis_A = sub_modis_A.values.transpose(1, 0, 2, 3)
             modis_A = modis_A / 32768.0
+            # band_order = [2, 3, 0, 1, 5, 6, 7, 8, 9]
+            band_order = [2, 3, 0, 1, 5, 6, 7, 8, 9]
+            modis_A = modis_A[band_order, ...]
 
             if self.standardizable:
                 landsat = self.__standardization(landsat, "landsat")
@@ -383,9 +399,13 @@ class DataLoader(data_utils.Dataset):
                 modis_A = torch.from_numpy(modis_A)
                 modis_A = modis_A.to(torch.float32)
 
-                label = self.__load_tiff([label_path], "label")
                 label = np.squeeze(label, axis=1)
-                label = label / 65535.0
+                label_max = self.stats['label_max']
+                label_min = self.stats['label_min']
+                label = (label - label_min[:, None, None]) \
+                    / (label_max[:, None, None] - label_min[:, None, None])
+                # label = label / 65535.0
+                label = np.power(label, 1 / 3)
                 label = torch.from_numpy(label)
                 label = torch.squeeze(label).to(torch.float32)
 
@@ -400,15 +420,10 @@ class DataLoader(data_utils.Dataset):
                 "modis_Q": modis_Q,
                 "modis_A": modis_A
             }
-        # # Transformer pad for time dimension.
-        # t_pad = 24 - imgs.shape[1]
-        # if t_pad != 0:
-        #     imgs = np.pad(imgs,
-        #                   ((0, 0), (0, t_pad), (0, 0), (0, 0)),
-        #                   'constant', constant_values=0.0)
 
         return {
             "landsat": landsat,
+            "label": label,
             # "modis_idx": modis_idx,  # Max sequence for searching MODIS dynamically
             # "doy": torch.tensor(doy),
         }
@@ -431,6 +446,16 @@ def PSNRLoss(origin_img, predict_img, max_val=1.0):
 
     return psnr
 
+def SAMLoss(pred, target, epsilon=1e-3):
+    """Spectral Angle Mapper Loss"""
+    dot_product = (pred * target).sum(dim=1)
+    pred_norm = torch.norm(pred, dim=1) + epsilon
+    target_norm = torch.norm(target, dim=1) + epsilon
+    cos_theta = dot_product / (pred_norm * target_norm)
+    sam = torch.mean(torch.acos(torch.clamp(cos_theta, epsilon - 1,
+                                            1 - epsilon)))
+
+    return sam
 
 def filter_dataset(dataset):
     """
@@ -462,16 +487,51 @@ def main():
     # align.align_dataset()
 
     # training configuration
-    category = "_vit(SEASON_2Sat)"
-    SECOND_TRAINING = False
+    category = "_swin(Blue)"
+    save_dir = "/lustre1/g/geog_geors/skguan/output/data_fusion"
+    SECOND_TRAINING = False  # TODO: whether training from checkpoint
+    TRAIN_MODE = True  # TODO: training mode, or prediction mode
+    STATS_AHEAD = True  # TODO: whether to use statistical indicators calculated ahead
     batch_size = 4  # *** hyper-param: batch size per iteration
     num_pairs = 6  # *** hyper-param: number of images before and after target label
     cloud_cover = 60  # *** hyper-param: maximum cloud cover
     epochs = 200  # ** hyper-param: total training epoches
     warm_up = 10  # * hyper-param: warm_up epoches
     psnr_factor = 1  # ** hyper-param: psnr ratio for loss function
-    lr = 3e-5  # *** hyper-parm: initialized learning rate
+    lr = 2e-5  # *** hyper-parm: initialized learning rate
     accumulation_steps = 2  # *** hyper-parm: avoid cuda out of memory
+    mean = {
+        "landsat": np.array([
+            0.17092103, 0.18993776, 0.1970036,
+            0.26657945, 0.23542055, 0.20343977
+        ]),
+        "modis_Q": np.array([0.04405082, 0.08351762]),
+        "modis_A": np.array([
+            0.02818005, 0.03974209, 0.04375133, 0.08329602, 0.07191321,
+            0.04652461, 0.1251346, 0.05636042, 0.11781512
+        ])
+    } if STATS_AHEAD else None
+    std = {
+        "landsat": np.array([
+            0.10450894, 0.09786381, 0.10292594,
+            0.0900249, 0.06540354, 0.05941229
+        ]),
+        "modis_Q": np.array([0.04172827, 0.03805931]),
+        "modis_A": np.array([
+            0.03898484, 0.0386714, 0.04099448, 0.03700938,
+            0.03117597, 0.05102653, 0.0419529, 0.04469905,
+            0.27136135
+        ])
+    } if STATS_AHEAD else None
+    label_max = np.array([
+        65454.,
+        # 65454., 65454., 65455., 65454., 65454.
+    ]) if STATS_AHEAD else None
+    label_min = np.array([
+        0.,
+        # 0., 0., 0., 4234., 6549.
+    ]) if STATS_AHEAD else None
+    Landsat = "Union"  # use what kind of landsat data
     n_splits = 5
     start_epoch = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -483,14 +543,14 @@ def main():
     df = pd.read_csv(dataset_file)
     train_files = df['train'].dropna().astype(str).to_list()
     train_files += df['val'].dropna().astype(str).to_list()
-    # train_files = filter_dataset(train_files)[:19]
+    # train_files = filter_dataset(train_files)[:20]
     test_files = df['test'].dropna().astype(str).to_list()
     # test_files = filter_dataset(test_files)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_metrics = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(kf.split(train_files)):
-        print(f"\nTraing Fold {fold_idx + 1} / {n_splits}")
+        print(f"\nTraining Fold {fold_idx + 1} / {n_splits}")
         # 划分当前fold的数据
         fold_train_files = [train_files[i] for i in train_idx]
         fold_val_files = [train_files[i] for i in val_idx]
@@ -498,32 +558,53 @@ def main():
         # 计算当前fold的landsat统计量
         stats_dataset = DataLoader(landsat_path, modis_path, label_path,
                                    fold_train_files, num_pairs=num_pairs,
-                                   cloud_cover=cloud_cover)
+                                   cloud_cover=cloud_cover, Landsat=Landsat)
         stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
                                                  shuffle=False)
+        if not STATS_AHEAD:
+            cgs = ComputeStats()
+            landsat_mean, landsat_std, label_max, label_min = cgs.compute_global_stats(
+                stats_dataloader, "landsat", mode='std',
+                category=category, save_dir=save_dir, channel_num=6
+            )
 
-        cgs = ComputeStats()
-        landsat_mean, landsat_std = cgs.compute_global_stats(
-            stats_dataloader, "landsat", channel_num=7
-        )
-        # print(MOD_idx)
 
-        # 计算当前fold的modis统计量
-        stats_dataset = DataLoader(landsat_path, modis_path, label_path,
-                                   fold_train_files, num_pairs=num_pairs,
-                                   cloud_cover=cloud_cover, MODIS=True)
-        stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
-                                                 shuffle=False)
-        modisQ_mean, modisQ_std = cgs.compute_global_stats(
-            stats_dataloader, "modis_Q", channel_num=2
-        )
-        modisA_mean, modisA_std = cgs.compute_global_stats(
-            stats_dataloader, "modis_A", channel_num=10
-        )
+            # 计算当前fold的modis统计量
+            stats_dataset = DataLoader(landsat_path, modis_path, label_path,
+                                       fold_train_files, num_pairs=num_pairs,
+                                       cloud_cover=cloud_cover, Landsat=Landsat,
+                                       MODIS=True)
+            stats_dataloader = data_utils.DataLoader(stats_dataset, batch_size=1,
+                                                     shuffle=False)
+            modisQ_mean, modisQ_std, _, _ = cgs.compute_global_stats(
+                stats_dataloader, "modis_Q", channel_num=2
+            )
+            modisA_mean, modisA_std, _, _ = cgs.compute_global_stats(
+                stats_dataloader, "modis_A", channel_num=9
+            )
+            mean = {
+                "landsat": landsat_mean,
+                "modis_Q": modisQ_mean,
+                "modis_A": modisA_mean
+            }
+            std = {
+                "landsat": landsat_std,
+                "modis_Q": modisQ_std,
+                "modis_A": modisA_std
+            }
+
+        print("\nStatistical Indicators:")
+        print("-----------------------------------")
+        print("Landsat:\nMean: {0}\nStd: {1}\n".format(mean['landsat'], std['landsat']))
+        print("MODIS_Q:\nMean: {0}\nStd: {1}\n".format(mean['modis_Q'], std['modis_Q']))
+        print("MODIS_A:\nMean: {0}\nStd: {1}\n".format(mean['modis_A'], std['modis_A']))
+        print("Label:\nMax: {0}\nMin: {1}".format(label_max, label_min))
+        print("-----------------------------------\n")
         stats = {
-            "landsat_mean": landsat_mean, "landsat_std": landsat_std,
-            "modis_Q_mean": modisQ_mean, "modis_Q_std": modisQ_std,
-            "modis_A_mean": modisA_mean, "modis_A_std": modisA_std
+            "landsat_mean": mean['landsat'], "landsat_std": std['landsat'],
+            "modis_Q_mean": mean['modis_Q'], "modis_Q_std": std['modis_Q'],
+            "modis_A_mean": mean['modis_A'], "modis_A_std": std['modis_A'],
+            "label_max": label_max, "label_min": label_min
         }
 
         train_dataset = DataLoader(
@@ -534,6 +615,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         train_dataloader = data_utils.DataLoader(
@@ -560,6 +642,7 @@ def main():
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         valid_dataloader = data_utils.DataLoader(
@@ -576,35 +659,43 @@ def main():
             num_workers=6,
             persistent_workers=True
         )
-        aux_steps = 12   # Fixed steps for a specific season
+        aux_steps = 12  # Fixed MODIS steps for a specific season
         # model = SpatioTemporalViT(t_patch=2, patch_size=4, d_model=512)
         # model = ResNet(in_channels=42, out_channels=7)
         # model = UNet(in_channels=42, out_channels=7)
-        model = ViT_Skip(main_steps=num_pairs * 2, main_spatch=16,
-                         main_tpatch=2, aux_steps=aux_steps, aux_spatch=2,
-                         aux_tpatch=1, aux_inchans=(2, 10), attn_drop_rate=0.1)
-        # model = SwinTransformer(main_steps=2 * num_pairs, main_spatch=4,
-        #                         main_tpatch=2, main_inchans=7, aux_size=18,
-        #                         aux_steps=aux_steps, aux_spatch=4, aux_tpatch=2,
-        #                         embed_dim=96, depths=[2, 2, 6, 2],
-        #                         num_heads=[3, 6, 12, 24], out_chans=7,
-        #                         window_sizes=[(2, 8, 8), (2, 8, 8),
-        #                                      (2, 4, 4), (2, 4, 4)])
+        # model = ViT_Skip(main_steps=num_pairs * 2, main_spatch=16,
+        #                  main_tpatch=2, aux_steps=aux_steps, aux_spatch=2,
+        #                  aux_tpatch=1, aux_inchans=(2, 10), attn_drop_rate=0.1,
+        #                  embed_dim=768, depth=12, num_heads=12, depth_wise=[3, 6, 9])
+        model = SwinTransformer(main_steps=2 * num_pairs, main_spatch=4,
+                                main_tpatch=2, main_inchans=6, aux_size=36,
+                                aux_steps=aux_steps, aux_spatch=2, aux_tpatch=4,
+                                aux_inchans=(2, 9), embed_dim=96, out_chans=1,
+                                depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
+                                window_sizes=[(2, 8, 8), (2, 8, 8),
+                                              (2, 4, 4), (4, 4, 4)])
 
         model.to(device)
-        criterion = nn.MSELoss()
+        criterion = nn.SmoothL1Loss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
                                       weight_decay=5e-4)
+        # weights = torch.tensor(
+        #     [1.5, 1.5, 1.5, 1.0, 1.0, 1.0],
+        #     dtype=torch.float32
+        # ).to(device)
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[
-                LinearLR(optimizer, start_factor=0.01,
-                         end_factor=1,
-                         total_iters=warm_up * len(train_dataloader)),
+                LinearLR(
+                    optimizer,
+                    start_factor=0.01,
+                    end_factor=1,
+                    total_iters=warm_up * len(train_dataloader)
+                ),
                 CosineAnnealingLR(
                     optimizer,
-                    T_max=(epochs - warm_up) * len(train_dataloader),
-                    eta_min=1e-6
+                    T_max=(epochs - warm_up) * len(train_dataloader) / 2,
+                    eta_min=5e-6
                 )
             ],
             milestones=[(warm_up) * len(train_dataloader)]
@@ -618,11 +709,19 @@ def main():
                         'valid_loss': [], 'valid_r2': [], 'valid_rmse': [],
                         'valid_psnr': [], 'valid_ssim': []}
         if SECOND_TRAINING:
-            check_point = torch.load(f"checkpoint_fold{fold_idx}{category}.pth")
-            model.load_state_dict(check_point['model'])
-            optimizer.load_state_dict(check_point['optimizer'])
-            scheduler.load_state_dict(check_point['scheduler'])
-            start_epoch = check_point['epoch']
+            checkpoint_path = os.path.join(
+                save_dir, "checkpoint",
+                f"checkpoint_fold{fold_idx}{category}.pth"
+            )
+            if os.path.exists(checkpoint_path):
+                check_point = torch.load(checkpoint_path)
+                model.load_state_dict(check_point['model'])
+                optimizer.load_state_dict(check_point['optimizer'])
+                scheduler.load_state_dict(check_point['scheduler'])
+                start_epoch = check_point['epoch'] + 1
+            else:
+                print("There is no referred checkpoint, please check!")
+                print("Training from initial state...")
 
         # RF测试
         # rf = RandomForestRegressor(n_estimators=100, max_depth=5)
@@ -635,145 +734,173 @@ def main():
         # y_val = y_val.reshape(7 * 256 * 256, 1)
         # y_pred = rf.predict(x_val)
         # print(r2_score(y_val.cpu().numpy(), y_pred))
-
-        for epoch in range(start_epoch, epochs + 1):
-            model.train()
-            label_list, pred_list = [], []
-            count = 0
-            loss_metric_train = 0
-            optimizer.zero_grad()
-            for iter, data in enumerate(train_dataloader):
-                train_landsat, train_modisQ, train_modisA, train_label = data
-                train_landsat = train_landsat.to(device, non_blocking=True)
-                train_modisQ = train_modisQ.to(device, non_blocking=True)
-                train_modisA = train_modisA.to(device, non_blocking=True)
-                train_label = train_label.to(device, non_blocking=True)
-                # doy = doy.to(device)
-
-                train_logits = model(train_landsat, train_modisQ, train_modisA)
-                psnr_loss = PSNRLoss(train_logits, train_label)
-                mse_loss = criterion.forward(train_logits, train_label)
-                train_loss = mse_loss + psnr_factor * (1 / psnr_loss)
-                scaled_loss = train_loss / accumulation_steps
-
-                # train_pred = train_logits.clone().detach()
-                scaled_loss.backward()
-                loss_metric_train += train_loss.item()
-                count += 1
-                if (iter + 1) % accumulation_steps == 0 or (iter + 1) == len(train_dataloader):
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
-
-                label_list.append(train_label.cpu().detach().numpy())
-                pred_list.append(train_logits.cpu().detach().numpy())
-                if iter % 10 == 0:
-                    current_avg_loss = loss_metric_train / count
-                    print("epoch: %d, iter: %d, lr: %g, loss: %g" %
-                          (epoch, iter, optimizer.param_groups[0]['lr'],
-                           current_avg_loss))
-                del train_landsat, train_modisQ, train_modisA
-                del train_label, train_logits
-                torch.cuda.empty_cache()
-            metrics_dict['train_loss'].append(loss_metric_train / count)
-            label_list = np.concatenate(label_list)
-            pred_list = np.concatenate(pred_list)
-            train_psnr = psnr(label_list, pred_list, data_range=1)
-            train_ssim = ssim(label_list, pred_list, data_range=1)
-            metrics_dict['train_psnr'].append(train_psnr)
-            metrics_dict['train_ssim'].append(train_ssim)
-            if train_psnr > temp_psnr:
-                np.savez(f"train_result_fold{fold_idx}{category}.npz",
-                         label_list[:30], pred_list[:30])
-            label_list = label_list.reshape(-1,)
-            pred_list = pred_list.reshape(-1,)
-            train_r2 = r2(label_list, pred_list)
-            metrics_dict['train_r2'].append(train_r2)
-            train_rmse = rmse(label_list, pred_list)
-            metrics_dict['train_rmse'].append(train_rmse)
-            print("epoch: %d, train_r2: %g, train_rmse: %g, "
-                  "train_psnr: %g, train_ssim: %g" %
-                  (epoch, train_r2, train_rmse, train_psnr, train_ssim))
-
-            if epoch % 2 == 0:
-                model.eval()
+        if TRAIN_MODE:
+            for epoch in range(start_epoch, epochs + 1):
+                model.train()
                 label_list, pred_list = [], []
                 count = 0
-                loss_metric_val = 0
-                with torch.no_grad():
-                    for data in valid_dataloader:
-                        valid_landsat, valid_modisQ, valid_modisA, valid_label = data
+                loss_metric_train = 0
+                optimizer.zero_grad()
+                for iter, data in enumerate(train_dataloader):
+                    train_landsat, train_modisQ, train_modisA, train_label = data
+                    train_landsat = train_landsat.to(device, non_blocking=True)
+                    train_modisQ = train_modisQ.to(device, non_blocking=True)
+                    train_modisA = train_modisA.to(device, non_blocking=True)
+                    train_label = train_label.to(device, non_blocking=True)
+                    # doy = doy.to(device)
+                    train_logits = model(train_landsat, train_modisQ, train_modisA)
+                    train_logits = torch.squeeze(train_logits)
+                    psnr_loss = PSNRLoss(train_logits, train_label)
+                    mse_loss = criterion.forward(train_logits, train_label)
+                    # mse_loss = torch.mean(weights[:, None, None] *
+                    #                       (train_logits - train_label) ** 2)
+                    train_loss = mse_loss + psnr_factor * (1 / psnr_loss)
+                    scaled_loss = train_loss / accumulation_steps
 
-                        valid_landsat = valid_landsat.to(device, non_blocking=True)
-                        valid_modisQ = valid_modisQ.to(device, non_blocking=True)
-                        valid_modisA = valid_modisA.to(device, non_blocking=True)
-                        valid_label = valid_label.to(device, non_blocking=True)
-                        # doy = doy.to(device)
+                    # train_pred = train_logits.clone().detach()
+                    scaled_loss.backward()
+                    loss_metric_train += train_loss.item()
+                    count += 1
+                    if ((iter + 1) % accumulation_steps == 0) or \
+                        ((iter + 1) == len(train_dataloader)):
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        scheduler.step()
 
-                        valid_logits = model(valid_landsat, valid_modisQ,
-                                             valid_modisA)
-                        psnr_loss = PSNRLoss(valid_logits, valid_label)
-                        mse_loss = criterion.forward(valid_logits, valid_label)
-                        valid_loss = mse_loss + psnr_factor * (1 / psnr_loss)
-
-                        loss_metric_val += valid_loss.item()
-                        count += 1
-                        label_list.append(valid_label.cpu().detach().numpy())
-                        pred_list.append(valid_logits.cpu().detach().numpy())
-
-                        del valid_landsat, valid_modisQ, valid_modisA,
-                        del valid_label, valid_logits
-                        torch.cuda.empty_cache()
-                metrics_dict['valid_loss'].append(loss_metric_val / count)
+                    label_list.append(train_label.cpu().detach().numpy())
+                    pred_list.append(train_logits.cpu().detach().numpy())
+                    if iter % 10 == 0:
+                        current_avg_loss = loss_metric_train / count
+                        print("epoch: %d, iter: %d, lr: %g, loss: %g" %
+                              (epoch, iter, optimizer.param_groups[0]['lr'],
+                               current_avg_loss))
+                    del train_landsat, train_modisQ, train_modisA
+                    del train_label, train_logits
+                    torch.cuda.empty_cache()
+                metrics_dict['train_loss'].append(loss_metric_train / count)
                 label_list = np.concatenate(label_list)
+                H, W = label_list.shape[-2:]
                 pred_list = np.concatenate(pred_list)
-                valid_psnr = psnr(label_list, pred_list, data_range=1)
-                valid_ssim = ssim(label_list, pred_list, data_range=1)
-                metrics_dict['valid_psnr'].append(valid_psnr)
-                metrics_dict['valid_ssim'].append(valid_ssim)
-                if valid_psnr > best_psnr:
-                    np.savez(f"val_result_fold{fold_idx}{category}.npz",
-                             label_list[:30], pred_list[:30])
+                train_psnr = psnr(label_list.reshape(-1, H, W),
+                                  pred_list.reshape(-1, H, W),
+                                  data_range=1)
+                train_ssim = ssim(label_list.reshape(-1, H, W),
+                                  pred_list.reshape(-1, H, W),
+                                  data_range=1, channel_axis=0)
+                metrics_dict['train_psnr'].append(train_psnr)
+                metrics_dict['train_ssim'].append(train_ssim)
+                if train_psnr > temp_psnr:
+                    save_path = os.path.join(
+                        save_dir, "train_files",
+                        f"train_result_fold{fold_idx}{category}.npz"
+                    )
+                    np.savez(save_path,
+                             label=label_list[:30],
+                             pred=pred_list[:30])
                 label_list = label_list.reshape(-1,)
                 pred_list = pred_list.reshape(-1,)
-                valid_r2 = r2(label_list, pred_list)
-                metrics_dict['valid_r2'].append(valid_r2)
-                valid_rmse = rmse(label_list, pred_list)
-                metrics_dict['valid_rmse'].append(valid_rmse)
+                train_r2 = r2(label_list, pred_list)
+                metrics_dict['train_r2'].append(train_r2)
+                train_rmse = rmse(label_list, pred_list)
+                metrics_dict['train_rmse'].append(train_rmse)
+                print("epoch: %d, train_r2: %g, train_rmse: %g, "
+                      "train_psnr: %g, train_ssim: %g" %
+                      (epoch, train_r2, train_rmse, train_psnr, train_ssim))
 
-                print("epoch: %d, valid_r2: %g, valid_rmse: %g, "
-                      "valid_psnr: %g, valid_ssim: %g" %
-                      (epoch, valid_r2, valid_rmse, valid_psnr, valid_ssim))
-                if valid_r2 > best_r2:
-                    best_r2 = valid_r2
-                    model_state = {
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'epoch': epoch
-                    }
-                    print("Fold %d: find best model in "
-                          "epoch %d with r2 score %f" %
-                          (fold_idx, epoch, best_r2))
-                    torch.save(model_state,
-                               f"checkpoint_fold{fold_idx}{category}.pth")
+                if epoch % 2 == 0:
+                    model.eval()
+                    label_list, pred_list = [], []
+                    count = 0
+                    loss_metric_val = 0
+                    with torch.no_grad():
+                        for data in valid_dataloader:
+                            valid_landsat, valid_modisQ, valid_modisA, valid_label = data
 
-        fold_metrics.append({'fold': fold_idx, 'best_r2': best_r2})
-        with open(f"metrics_fold{fold_idx}{category}.pkl", 'wb') as f:
-            pkl.dump(metrics_dict, f)
-        key = ["loss", "r2", "rmse", "psnr", "ssim"]
-        sp = StatsPlot()
-        file_name = f"metric_plot_fold{fold_idx}{category}.png"
-        sp.line_plot(metrics_dict, key, file_name=file_name)
+                            valid_landsat = valid_landsat.to(device, non_blocking=True)
+                            valid_modisQ = valid_modisQ.to(device, non_blocking=True)
+                            valid_modisA = valid_modisA.to(device, non_blocking=True)
+                            valid_label = valid_label.to(device, non_blocking=True)
+                            # doy = doy.to(device)
+
+                            valid_logits = model(valid_landsat, valid_modisQ, valid_modisA)
+                            valid_logits = torch.squeeze(valid_logits)
+                            psnr_loss = PSNRLoss(valid_logits, valid_label)
+                            mse_loss = criterion.forward(valid_logits, valid_label)
+                            valid_loss = mse_loss + psnr_factor * (1 / psnr_loss)
+
+                            loss_metric_val += valid_loss.item()
+                            count += 1
+                            label_list.append(valid_label.cpu().detach().numpy())
+                            pred_list.append(valid_logits.cpu().detach().numpy())
+
+                            del valid_landsat, valid_modisQ, valid_modisA,
+                            del valid_label, valid_logits
+                            torch.cuda.empty_cache()
+                    metrics_dict['valid_loss'].append(loss_metric_val / count)
+                    label_list = np.concatenate(label_list)
+                    pred_list = np.concatenate(pred_list)
+                    valid_psnr = psnr(label_list.reshape(-1, H, W),
+                                      pred_list.reshape(-1, H, W),
+                                      data_range=1)
+                    valid_ssim = ssim(label_list.reshape(-1, H, W),
+                                      pred_list.reshape(-1, H, W),
+                                      data_range=1, channel_axis=1)
+                    metrics_dict['valid_psnr'].append(valid_psnr)
+                    metrics_dict['valid_ssim'].append(valid_ssim)
+                    if valid_psnr > best_psnr:
+                        save_path = os.path.join(
+                            save_dir, "val_files",
+                            f"val_result_fold{fold_idx}{category}.npz"
+                        )
+                        np.savez(save_path, label=label_list, pred=pred_list)
+                    label_list = label_list.reshape(-1,)
+                    pred_list = pred_list.reshape(-1,)
+                    valid_r2 = r2(label_list, pred_list)
+                    metrics_dict['valid_r2'].append(valid_r2)
+                    valid_rmse = rmse(label_list, pred_list)
+                    metrics_dict['valid_rmse'].append(valid_rmse)
+
+                    print("epoch: %d, valid_r2: %g, valid_rmse: %g, "
+                          "valid_psnr: %g, valid_ssim: %g" %
+                          (epoch, valid_r2, valid_rmse, valid_psnr, valid_ssim))
+                    if valid_r2 > best_r2:
+                        best_r2 = valid_r2
+                        model_state = {
+                            'model': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'scheduler': scheduler.state_dict(),
+                            'epoch': epoch
+                        }
+                        print("Fold %d: find best model in "
+                              "epoch %d with r2 score %f" %
+                              (fold_idx, epoch, best_r2))
+                        save_path = os.path.join(
+                            save_dir, "checkpoint",
+                            f"checkpoint_fold{fold_idx}{category}.pth"
+                        )
+                        torch.save(model_state, save_path)
+
+            fold_metrics.append({'fold': fold_idx, 'best_r2': best_r2})
+            save_path = os.path.join(
+                save_dir, "metrics",
+                f"metrics_fold{fold_idx}{category}.pkl"
+            )
+            with open(save_path, 'wb') as f:
+                pkl.dump(metrics_dict, f)
+            key = ["loss", "r2", "rmse", "psnr", "ssim"]
+            sp = StatsPlot()
+            file_name = f"./loss_pics/metric_plot_fold{fold_idx}{category}.png"
+            sp.line_plot(metrics_dict, key, file_name=file_name)
 
         test_dataset = DataLoader(
             landsat_path,
             modis_path,
             label_path,
-            test_files,
+            fold_val_files,
             num_pairs=num_pairs,
             cloud_cover=cloud_cover,
             stats=stats,
+            Landsat=Landsat,
             MODIS=True
         )
         test_dataloader = data_utils.DataLoader(
@@ -791,7 +918,11 @@ def main():
             num_workers=6,
             persistent_workers=True
         )
-        check_point = torch.load(f"checkpoint_fold{fold_idx}{category}.pth")
+        checkpoint_path = os.path.join(
+            save_dir, "checkpoint",
+            f"checkpoint_fold{fold_idx}{category}.pth"
+        )
+        check_point = torch.load(checkpoint_path)
         model.load_state_dict(check_point['model'])
         model.eval()
         label_list, pred_list = [], []
@@ -808,6 +939,7 @@ def main():
                 # doy = doy.to(device)
 
                 test_logits = model(test_landsat, test_modisQ, test_modisA)
+                test_logits = torch.squeeze(test_logits)
                 psnr_loss = PSNRLoss(test_logits, test_label)
                 mse_loss = criterion.forward(test_logits, test_label)
                 test_loss = mse_loss + psnr_factor * (1 / psnr_loss)
@@ -825,10 +957,17 @@ def main():
               (fold_idx, loss_metric_test / count))
         label_list = np.concatenate(label_list)
         pred_list = np.concatenate(pred_list)
-        test_psnr = psnr(label_list, pred_list, data_range=1)
-        test_ssim = ssim(label_list, pred_list, data_range=1)
-        np.savez(f"test_result_fold{fold_idx}{category}.npz",
-                 label_list[:30], pred_list[:30])
+        test_psnr = psnr(label_list.reshape(-1, H, W),
+                         pred_list.reshape(-1, H, W),
+                         data_range=1)
+        test_ssim = ssim(label_list.reshape(-1, H, W),
+                         pred_list.reshape(-1, H, W),
+                         data_range=1, channel_axis=1)
+        save_path = os.path.join(
+            save_dir, "val_files",
+            f"val_result_fold{fold_idx}{category}.npz"
+        )
+        np.savez(save_path, label=label_list, pred=pred_list)
         label_list_all = label_list.reshape(-1,)
         pred_list_all = pred_list.reshape(-1,)
         test_r2 = r2(label_list_all, pred_list_all)
