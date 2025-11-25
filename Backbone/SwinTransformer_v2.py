@@ -6,7 +6,7 @@
 
 @type: script
 
-Created on Mon Jun 16 19:44:25 2025, HONG KONG
+Created on Thu Oct 9 14:48:36 2025, HONG KONG
 
 Second Version of FPN and PPM Decoder
 """
@@ -81,7 +81,7 @@ class PatchMerging3D(nn.Module):
             H += H % 2
             W += W % 2
         if self.temporal_merge:
-            x000 = x[:, 0::2, 0::2, 0::2, :]  # B, T // 2, H // 2, W // 2, C
+            x000 = x[:, 0::2, 0::2, 0::2, :]
             x001 = x[:, 0::2, 0::2, 1::2, :]
             x010 = x[:, 0::2, 1::2, 0::2, :]
             x011 = x[:, 0::2, 1::2, 1::2, :]
@@ -89,14 +89,14 @@ class PatchMerging3D(nn.Module):
             x101 = x[:, 1::2, 0::2, 1::2, :]
             x110 = x[:, 1::2, 1::2, 0::2, :]
             x111 = x[:, 1::2, 1::2, 1::2, :]
-            x = torch.cat([x000, x001, x010, x011, x100, x101, x110, x111], -1)
+            x = torch.cat([x000, x001, x010, x011, x100, x101, x110, x111], -1)  # B T // 2, H // 2, W // 2, 8 * C
             t_blk = T // 2
         else:
-            x0 = x[:, :, 0::2, 0::2, :]  # B T H/2 W/2 C
-            x1 = x[:, :, 0::2, 1::2, :]  # B T H/2 W/2 C
-            x2 = x[:, :, 1::2, 0::2, :]  # B T H/2 W/2 C
-            x3 = x[:, :, 1::2, 1::2, :]  # B T H/2 W/2 C
-            x = torch.cat([x0, x1, x2, x3], -1)  # B T H/2 W/2 4*C
+            x0 = x[:, :, 0::2, 0::2, :]
+            x1 = x[:, :, 0::2, 1::2, :]
+            x2 = x[:, :, 1::2, 0::2, :]
+            x3 = x[:, :, 1::2, 1::2, :]
+            x = torch.cat([x0, x1, x2, x3], -1)  # B T H // 2 W // 2 4 * C
             t_blk = T // 1
 
         h_blk = H // 2
@@ -192,7 +192,7 @@ class WindowAttention3D(nn.Module):
 
 
 class SwinTransformerBlock3D(nn.Module):
-    def __init__(self, dim, input_resolution, num_heads, window_size=(2, 8, 8),
+    def __init__(self, dim, input_resolution, num_heads, window_size=(1, 7, 7),
                  shift_size=(0, 0, 0), mlp_ratio=4., qkv_bias=True,
                  qk_scale=None, drop=0., attn_drop=0.):
         super().__init__()
@@ -492,14 +492,7 @@ class CNNFeatureEnhancement(nn.Module):
             nn.BatchNorm3d(out_channels),
             nn.GELU()
         )
-        self.channel_attn = nn.Sequential(
-            nn.AdaptiveMaxPool3d(1),
-            nn.Conv3d(out_channels, out_channels // 8, 1),
-            nn.GELU(),
-            nn.Conv3d(out_channels // 8, out_channels, 1),
-            nn.Sigmoid()
-        )
-        self.spectral_attn = SpectralAttention(out_channels)
+        self.spectral_attn = SpectralAttention(out_channels, reduction_ratio=2)
         self.spatial_attn = nn.Sequential(
             nn.Conv3d(out_channels, 1, kernel_size=1),
             nn.Sigmoid()
@@ -546,47 +539,6 @@ class ResiduleUpBlock(nn.Module):
 
         return self.activation(x_up)
 
-class Decoder(nn.Module):
-    def __init__(self, embed_dim=768, img_size=256, t_patch=24,
-                 patch_size=16, out_chans=7, skip_dims=[48, 96, 192, 384, 768]):  # Updated skip dimensions
-        super().__init__()
-        self.t_patch = t_patch
-        self.patch_size = patch_size
-        self.skip_features = skip_dims[::-1]
-
-        self.residule_up = nn.ModuleList([
-            ResiduleUpBlock(in_ch, out_ch, ksp)
-            for in_ch, out_ch, ksp in zip(
-                [x * 2 for x in self.skip_features],
-                [x // 2 for x in self.skip_features],
-                [False] * 3 + [True, False])
-        ])
-
-        self.conv = nn.Conv3d(24, out_chans,
-                              kernel_size=(1, 1, 1),
-                              stride=(1, 1, 1),
-                              padding=(0, 0, 0))
-
-    def forward(self, x, original_shape, thw_blocks, encoder_features):
-        B, _, _ = x.shape
-        _, _, T, H, W = original_shape
-
-        t_blk, h_blk, w_blk = thw_blocks
-        x = x.view(B, t_blk, h_blk, w_blk, -1)
-        x = x.permute(0, 4, 1, 2, 3)  # (B, C, t_blk, h_blk, w_blk)
-        # Process hierarchical features
-        for i, (up_block, skip_feat) in enumerate(zip(self.residule_up,
-                                                      encoder_features)):
-            # Skip features are already in 3D format
-            skip_feat = skip_feat.permute(0, 4, 1, 2, 3)  # (B, C, T, H, W)
-
-            x = torch.cat([x, skip_feat], dim=1)
-            x = up_block(x, skip=None)
-        x = self.conv(x)
-        x = x.mean(dim=2)
-
-        return x
-
 
 class PPM(nn.Module):
     def __init__(self, in_channels, out_channels, reduction_ratio=4,
@@ -625,7 +577,7 @@ class PPM(nn.Module):
 
 class FPN(nn.Module):
     def __init__(self, embed_dim=768, img_size=256, t_patch=24,
-                 patch_size=16, out_chans=7, skip_dims=[48, 96, 192, 384, 768]):
+                 patch_size=16, out_chans=7, skip_dims=[96, 96, 192, 384, 768]):
         super().__init__()
         self.pyramid_dim = 96  # Fixed channel dimension for FPN features
         num_levels = len(skip_dims)
@@ -707,39 +659,51 @@ class SpatialDownScale(nn.Module):
     """U-Net DownSample Module"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+        self.double_conv1 = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels // 2, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(out_channels // 2),
             nn.GELU(),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            nn.Conv3d(out_channels // 2, out_channels // 2, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(out_channels // 2),
             nn.GELU()
         )
         self.maxpool = nn.MaxPool3d((1, 2, 2))
+        self.double_conv2 = nn.Sequential(
+            nn.Conv3d(out_channels // 2, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU(),
+            nn.Conv3d(out_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU()
+        )
 
     def forward(self, x):
-        x = self.double_conv(x)
+        x = self.double_conv1(x)
         x = self.maxpool(x)
+        x = self.double_conv2(x)
         return x.permute(0, 2, 3, 4, 1)
 
 
 class SpatialUpScale(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.GELU(),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+        self.pre_conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
             nn.BatchNorm3d(out_channels),
             nn.GELU()
         )
         self.up_scale = nn.Upsample(scale_factor=(1, 2, 2), mode='trilinear',
-                                    align_corners=True)
+                                    align_corners=False)
+        self.post_conv = nn.Sequential(
+            nn.Conv3d(out_channels, out_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU()
+        )
 
     def forward(self, x):
+        x = self.pre_conv(x)
         x = self.up_scale(x)
-        x = self.double_conv(x)
+        x = self.post_conv(x)
 
         return x
 
@@ -747,46 +711,30 @@ class SpatialUpScale(nn.Module):
 class InformationMerge(nn.Module):
     def __init__(self, in_channels=(2, 10), embed_dim=96):
         super().__init__()
-        out_dim = embed_dim - in_channels[0]
-        self.up_scale = SpatialUpScale(in_channels[1], out_dim)
+        self.up_scale = SpatialUpScale(in_channels[1], embed_dim)
+        self.res_conv = nn.Conv3d(in_channels[0], embed_dim, 1) if in_channels[0] != embed_dim else nn.Identity()
+        self.double_conv = nn.Sequential(
+            nn.Conv3d(in_channels[0], embed_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(embed_dim),
+            nn.GELU(),
+            nn.Conv3d(embed_dim, embed_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(embed_dim),
+            nn.GELU()
+        )
+        self.final_conv = nn.Conv3d(embed_dim * 2, embed_dim, kernel_size=1)
 
     def forward(self, x1, x2):
         x2 = self.up_scale(x2)
+        x1_res = self.res_conv(x1)
+        x1 = self.double_conv(x1)
+        x1 = x1 + x1_res
         x = torch.cat([x1, x2], dim=1)
+        x = self.final_conv(x)
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        B, _, _, _, C = x.shape
+        x = x.view(B, -1, C)
 
         return x
-
-
-# class FeatureFusion(nn.Module):
-#     def __init__(self, main_dim, aux_dim, out_dim):
-#         super().__init__()
-#         self.main_fc = nn.Linear(main_dim, out_dim)
-#         self.aux_fc = nn.Linear(aux_dim, out_dim)
-
-#         self.gate = nn.Sequential(
-#             nn.Linear(out_dim * 2, out_dim),
-#             nn.GELU(),
-#             nn.Linear(out_dim, out_dim),
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, main_feat, aux_feat):
-#         main_proj = self.main_fc(main_feat)
-#         _, L, _ = main_proj.shape
-#         aux_proj = self.aux_fc(aux_feat)
-#         _, l, _ = aux_proj.shape
-#         if l > L:
-#             aux_proj = aux_proj[:, :L, :]  # 截断到主干相同长度
-#         else:
-#             pad_l = L - l
-#             aux_proj = F.pad(aux_proj, (0, 0, 0, pad_l))
-
-#         combined = torch.cat([main_proj, aux_proj], dim=-1)
-#         gate = self.gate(combined)
-#         fused = gate * main_proj + (1 - gate) * aux_proj
-
-#         return fused
-
 
 class FeatureFusion(nn.Module):
     def __init__(self, out_dim):
@@ -821,7 +769,7 @@ class SwinTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.embed_dim = embed_dim
         # First Downsample
-        self.first_conv = SpatialDownScale(main_inchans, embed_dim // 2)
+        self.first_conv = SpatialDownScale(main_inchans, embed_dim)
         # Patch embedding
         self.main_patch_embed = PatchEmbed3D(main_size, main_steps, main_spatch,
                                              main_tpatch, main_inchans,
@@ -923,8 +871,8 @@ class SwinTransformer(nn.Module):
         self.end_fusion = FeatureFusion(x_out_dims[-1])
         # Image Reconstrcution
         self.decoder = FPN(x_out_dims[-1], main_size,
-                               main_tpatch, main_spatch, out_chans,
-                               skip_dims=[embed_dim // 2] + x_out_dims)
+                           main_tpatch, main_spatch, out_chans,
+                           skip_dims=[embed_dim] + x_out_dims)
 
     def forward(self, x, x1, x2):
         # Save 128 Features
@@ -940,8 +888,6 @@ class SwinTransformer(nn.Module):
 
         # Process Auxiliary Branch
         x1 = self.info_merge(x1, x2)
-        x1 = x1.permute(0, 2, 3, 4, 1).contiguous()
-        x1 = x1.view(B, -1, C)
 
         # Process through hierarchical stages
         for i, (x_stage, x1_stage) in enumerate(zip(self.x_stages, self.x1_stages)):
@@ -960,10 +906,9 @@ class SwinTransformer(nn.Module):
                 fused_feature = gate * x + (1 - gate) * cnn_feature.view(
                     B, -1, cnn_feature.shape[-1]
                 )
-                x = fused_feature
                 self.encoder_features.append(fused_feature.view(B, x_tblk, x_hblk,
                                                                 x_wblk, -1))
-            elif i == 3:
+            if i == 3:
                 x = self.end_fusion(x, (x_tblk, x_hblk, x_wblk),
                                     x1, (x1_tblk, x1_hblk, x1_wblk))
         x = self.decoder(x.view(B, -1, x.shape[-1]), original_shape,

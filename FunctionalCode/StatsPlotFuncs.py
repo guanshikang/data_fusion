@@ -113,7 +113,7 @@ class StatsPlot:
         fig.savefig(save_path, dpi=600, bbox_inches='tight')
 
     def line_plot(self, metrics, key, col=3, file_name=None):
-        fig = plt.figure(facecolor='w', figsize=(10, 6))
+        fig = plt.figure(facecolor='w', figsize=(16, 12))
         num = len(key)
         row = num // col + 1 if (num > col) else 1
         for i in range(row):
@@ -123,7 +123,7 @@ class StatsPlot:
                     break
                 ax = fig.add_subplot(row, col, count + 1)
                 train_key = "train_{}".format(key[count])
-                val_key = "valid_{}".format(key[count])
+                val_key = "val_{}".format(key[count])
                 y1 = metrics[train_key]
                 y2 = metrics[val_key]
                 x1 = [i for i in range(len(y1))]
@@ -138,9 +138,40 @@ class StatsPlot:
         save_path = os.path.join(self.save_dir, file_name)
         fig.savefig(save_path, dpi=600, bbox_inches='tight')
 
+    def doy_line_plot(self, metrics, names, col=3, file_name=None):
+        fig = plt.figure(facecolor='w', figsize=(16, 12))
+        num = len(names)
+        row = num // col + 1 if (num > col) else 1
+        for i in range(row):
+            for j in range(col):
+                count = i * col + j
+                if count + 1 > num:
+                    break
+                ax = fig.add_subplot(row, col, count + 1)
+                train_key = "Our Model"
+                val_key = "Ground Truth"
+                test_key = "SwinSTFM"
+                y1 = [x[count] for x in metrics['y_pred']]
+                y2 = [x[count] for x in metrics['y_label']]
+                y3 = [x[count] for x in metrics['y_compare']]
+                x1 = metrics['x_pred']
+                x2 = metrics['x_label']
+                ax.plot(x1, y1, label=train_key)
+                ax.plot(x2, y2, label=val_key)
+                ax.plot(x1, y3, label=test_key)
+                ax.legend(ncol=1, frameon=False)
+                ax.set_xticks(x1[::5])
+                ax.set_xticklabels(metrics['doy'][::5])
+                ax.set_xlabel("DOY", fontsize=12)
+                ax.set_ylabel("{}".format(names[count]), fontsize=12)
+
+        file_name = file_name if file_name is not None else "metric_plot.png"
+        save_path = os.path.join(self.save_dir, file_name)
+        fig.savefig(save_path, dpi=600, bbox_inches='tight')
+
     def hist_plot(self, y):
         fig, ax = plt.subplots(facecolor='w', figsize=(7, 6))
-        hist = ax.hist(y, bins=50)
+        hist = ax.hist(y, bins=100)
 
         ax.tick_params(
             size=3,

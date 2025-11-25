@@ -8,7 +8,7 @@
 
 Created on Mon Nov 03 15:28:48 2025, HONG KONG
 
-Fourth Version of
+Fourth Version of pure swin as feature extraction module.
 """
 import torch
 import torch.nn as nn
@@ -16,8 +16,6 @@ import torch.nn.functional as F
 
 from functools import reduce
 from operator import mul
-from torch.utils.checkpoint import checkpoint
-
 
 class PatchEmbed3D(nn.Module):
     def __init__(self, img_size=256, time_steps=12, patch_size=4, t_patch=2,
@@ -521,39 +519,6 @@ class CNNFeatureEnhancement(nn.Module):
         sa = self.spatial_attn(x)
         x = x * sa
         return x + residual
-
-
-class ResiduleUpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, temporal_up=True):
-        super().__init__()
-        if temporal_up:
-            ksp = (4, 2, 1)
-        else:
-            ksp = (1, 1, 0)
-        self.up_conv = nn.ConvTranspose3d(
-            in_channels, out_channels,
-            kernel_size=(ksp[0], 4, 4),
-            stride=(ksp[1], 2, 2),
-            padding=(ksp[2], 1, 1)
-        )
-        self.bn1 = nn.BatchNorm3d(out_channels)
-        self.activation = nn.GELU()
-
-    def forward(self, x, skip=None):
-        x_up = self.up_conv(x)
-        x_up = self.bn1(x_up)
-
-        if skip is not None:
-            if skip.shape[-2:] != x_up.shape[-2:]:
-                skip = F.interpolate(
-                    skip,
-                    size=x_up.shape[-2:],
-                    mode='bilinear',
-                    align_corners=True
-                )
-            x_up = torch.cat([x_up, skip], dim=1)
-
-        return self.activation(x_up)
 
 
 class PPM(nn.Module):

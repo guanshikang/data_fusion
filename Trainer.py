@@ -68,6 +68,7 @@ class Trainer:
         self.prepare_dataloader()
         if self.model is None:
             self.setup_model()
+        self.model.to(self.device)
         if self.optimizer is None or self.scheduler is None:
             self.setup_optimizer_scheduler()
         if self.cfg['status']['checkpoint']:
@@ -116,8 +117,8 @@ class Trainer:
         print("\n" + "-" * 25 + " TEST STAGE " + "-" * 25)
         if os.path.exists(self.checkpoint_path):
             check_point = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(check_point['model'])
-            self.val_dataset.update_progressive_epoch(check_point['best_epoch'])
+            self.model.load_state_dict(check_point['model'], strict=True)
+            self.test_dataset.update_progressive_epoch(check_point['best_epoch'])
             print(f"\nLoaded checkpoint from {self.checkpoint_path}")
         else:
             print("\nNo checkpoint provided, using current model weights.")
@@ -194,12 +195,14 @@ class Trainer:
                                                         prefetch_factor=4)
                 temp_ls = []
                 for batch in temp_loader:
-                    label_path, landsat_idx, modix_idx = batch
+                    label_path, landsat_idx, modix_idx, ltarget_idx, mtarget_idx = batch
                     for path, lidx, midx in zip(label_path, landsat_idx, modix_idx):
                         temp_dict = {
                             'label_path': path,
                             'landsat_idx': lidx.numpy().tolist(),
-                            'modis_idx': midx.numpy().tolist()
+                            'modis_idx': midx.numpy().tolist(),
+                            'ltarget_idx': ltarget_idx.numpy().tolist(),
+                            'mtarget_idx': mtarget_idx.numpy().tolist()
                         }
                         temp_ls.append(temp_dict)
                 new_files.append(temp_ls)
@@ -261,7 +264,9 @@ class Trainer:
                 torch.stack([x['modis_Q'] for x in batch]),
                 torch.stack([x['modis_A'] for x in batch]),
                 torch.stack([x['label'] for x in batch]),
-                torch.stack([x['gt_mask'] for x in batch])
+                torch.stack([x['gt_mask'] for x in batch]),
+                [x['ltarget_idx'] for x in batch],
+                [x['mtarget_idx'] for x in batch]
             )
         batch_size = kwargs.get('batch_size', self.cfg['base']['batch_size'])
         shuffle = kwargs.get('shuffle', True)
@@ -284,7 +289,7 @@ class Trainer:
     def setup_model(self):
         """Initialize model and move to device"""
         print("Initialize model from default SwinTransformer.")
-        self.model = SwinTransformer(**self.cfg['model_params']).to(self.device)
+        self.model = SwinTransformer(**self.cfg['model_params'])
 
     def setup_optimizer_scheduler(self):
         """Setup optimizer and learning rate scheduler"""
@@ -548,13 +553,18 @@ class Trainer:
             self.metrics_dict[f'{stage}_{k}'].append(v)
 
     def get_logits(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
-        landsat, modisQ, modisA, label, gt_mask = batch
+        landsat, modisQ, modisA, label, gt_mask, ltarget_idx, mtarget_idx = batch
         landsat = landsat.to(self.device, non_blocking=True)
         modisQ = modisQ.to(self.device, non_blocking=True)
         modisA = modisA.to(self.device, non_blocking=True)
         label = label.to(self.device, non_blocking=True)
         gt_mask = gt_mask.to(self.device, non_blocking=True)
-        logits = self.model(landsat, modisQ, modisA)
+        # # todo: change input mode here
+        logits = self.model(landsat, modisQ, modisA, ltarget_idx, mtarget_idx)
+        # c0 = modisA[:, :6, 0, ...]
+        # f0 = landsat[:, :6, 0, ...]
+        # c1 = modisA[:, :6, 1, ...]
+        # logits = self.model(c0, f0, c1)
 
         del landsat, modisQ, modisA
         return logits, label, gt_mask

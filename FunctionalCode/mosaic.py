@@ -41,13 +41,12 @@ def GetExtent(in_fn):
 
 
 def main():
-    path = "/fossfs/skguan/MOD_Samples/ref_image"
+    path = "/fossfs/skguan/DATA/7.GLC30_p"
     os.chdir(path)
-    in_files = glob.glob("*A2014*.tif")
+    in_files = glob.glob("*Annual*.tif")
 
     in_fn = in_files[0]
-    date = re.match(".*A(\\d{7}).*", in_fn).group(1)
-    filename = "{}.tif".format(date)
+    filename = "/fossfs/skguan/data_fusion/GLC30_2022.tif"
     if os.path.exists(filename):
         os.remove(filename)
     # 获取待镶嵌栅格的最大最小的坐标值
@@ -91,7 +90,7 @@ def main():
         trans = gdal.Transformer(in_ds, out_ds, [])  # in_ds是源栅格，out_ds是目标栅格
         _, xyz = trans.TransformPoint(False, 0, 0)  # 计算in_ds中左上角像元对应out_ds中的行列号
         x, y, _ = map(math.ceil, xyz)
-        in_da = in_ds.GetRasterBand(1).ReadAsArray()
+        in_da = in_ds.GetRasterBand(23).ReadAsArray()
         out_da = out_band.ReadAsArray(x, y, in_ds.RasterXSize, in_ds.RasterYSize)
         in_da = np.where((in_da == 0) & (out_da != 0), out_da, in_da)
         try:
@@ -102,7 +101,7 @@ def main():
             print("Total rows and cols are {0}, {1}".format(rows, columns))
             print("Total file number is {}".format(len(in_files)))
 
-    print("%s has finished the mean overlay" % date)
+    # print("%s has finished the mean overlay" % date)
     del in_ds, out_band, out_ds
 
 

@@ -1,6 +1,7 @@
 [base]
-category = "swin(PureSwin_x_92)"  # training strategy
+category = "swin(time_mean)"  # training strategy
 dataset_file = "/fossfs/skguan/data_fusion/dataset_23lr_c0n1_new.csv"
+checkpoint_path = "/fossfs/skguan/output/data_fusion/checkpoint/checkpoint_swin(stage_baseline_tanh)_ep158.pth"
 save_dir = "/fossfs/skguan/output/data_fusion"  # save directory for intermediate result
 lr = 2e-5  # initialized learning rate
 batch_size = 8  # batch size per iteration
@@ -22,21 +23,20 @@ label_path = "/fossfs/skguan/data_fusion/labels"
 image_size = 256
 num_pairs = 1  # ! number of images before and after target label, if it be changed, [model_params] also needs corresponding changes.
 cloud_cover = 0  # maximum cloud cover
-temporal_mode = "all"  # time series is from left / two side(s) of target date. All -> left & right. Left -> left. Case Insensitive.
+temporal_mode = "All"  # time series is from left / two side(s) of target date. All -> left & right. Left -> left. Case Insensitive.
 Landsat = "Union"  # two kind of landsat data use strategy. Single -> 8. Union -> 8 & 9. Case Insensitive.
+modis_upsample = false  # if upsampling modis_A data, default to false.
 
 [dataloader.stats]
 landsat_mean = [0.10791317, 0.15416187, 0.17981037, 0.2793933, 0.25418684, 0.20633668]
 landsat_std = [0.11960455, 0.1315887, 0.14383233, 0.14296927, 0.13645747, 0.12813972]
-modis_Q_mean = [0.18373369, 0.27085745]
-modis_Q_std = [0.14036317, 0.12943272]
+modis_Q_mean = [0.18372913, 0.27085447]
+modis_Q_std = [0.14010933, 0.12917025]
 modis_A_mean = [
-    1.1076516e-01, 1.5815526e-01, 1.8305071e-01, 2.7039230e-01, 2.6292831e-01,
-    2.0398504e-01, 4.1575423e-01, 1.6603811e+01, 1.1338254e+02,
+   0.110757776, 0.158141822, 0.183051065, 0.270388663, 0.263032466, 0.205368385, 41.5754395, 16.6038113, 113.382538
 ]
 modis_A_std = [
-    0.12624593, 0.12801248, 0.13859491, 0.12668984, 0.1270188, 0.1379804,
-    0.13967857, 13.882815, 44.857395
+    0.12615031, 0.12786923, 0.1384113, 0.12651284, 0.12599376, 0.12664199, 13.967811, 13.882815, 44.857395
 ]
 
 [dataloader.progressive_config]
@@ -49,16 +49,24 @@ relaxed_ratio = 1.0
 
 [model_params]
 main_steps = 2  # TODO: if temporal_mode is 'all', this shoubld be 2 * num_pairs else num_pairs
-main_spatch = 2
-main_tpatch = 2
+main_spatch = 4
+main_tpatch = 1
 main_inchans = 6
 aux_size = 36
 aux_steps = 3  # TODO: if temporal_mode is 'all', this shoubld be 2 * num_pairs + 1 else num_pairs
 aux_spatch = 2
 aux_tpatch = 2
 aux_inchans = [2, 9]
-embed_dim = 92
+embed_dim = 96
 out_chans = 6
 depths = [2, 2, 6, 2]
-num_heads = [2, 4, 8, 16]
+num_heads = [3, 6, 12, 24]
 window_sizes = [[2, 8, 8], [2, 8, 8], [2, 4, 4], [2, 4, 4]]  # This item should be converted to [tuple] for model compatibility.
+
+[loss_weights]
+reconstruction = 1.0  # default to 1.0 for Our Model.
+ssim_loss = 0.8  # default to 0.8 for Our Model.
+edge_loss = 0.0  # default to 0.0 for Our Model.
+spectral_loss = 0.0  # default to 0.0 for Our Model.
+smooth_loss = 0.0  # default to 0.0 for Our Model.
+spectral_angle = 0.5  # default to 1.2 for Our Model.

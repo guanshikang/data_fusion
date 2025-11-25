@@ -1,0 +1,42 @@
+[base]
+device = "cuda"
+checkpoint_path = "/fossfs/skguan/output/data_fusion/checkpoint/checkpoint_swin(stage_baseline_tanh)_ep158.pth"
+save_dir = "/fossfs/skguan/output/data_fusion/inference/OurModel"
+
+[dataloader]
+landsat_path = "/fossfs/skguan/data_fusion/inference/landsat"
+modis_path = "/fossfs/skguan/data_fusion/inference/modis"
+num_pairs = 1  # number of images before and after target label
+cloud_cover = 0  # maximum cloud cover
+temporal_mode = "All"  # time series is from left / two side(s) of target date. All -> left & right. Left -> left. Case Insensitive.
+Landsat = "Union"  # two kind of landsat data use strategy. Single -> 8. Union -> 8 & 9.
+modis_upsample = false  # if upsampling modis_A data, default to false.
+dates = ["20230101", "20231230", 8]
+
+[dataloader.stats]
+landsat_mean = [0.10791317, 0.15416187, 0.17981037, 0.2793933, 0.25418684, 0.20633668]
+landsat_std = [0.11960455, 0.1315887, 0.14383233, 0.14296927, 0.13645747, 0.12813972]
+modis_Q_mean = [0.18372913, 0.27085447]
+modis_Q_std = [0.14010933, 0.12917025]
+modis_A_mean = [
+   0.110757776, 0.158141822, 0.183051065, 0.270388663, 0.263032466, 0.205368385, 41.5754395, 16.6038113, 113.382538
+]
+modis_A_std = [
+    0.12615031, 0.12786923, 0.1384113, 0.12651284, 0.12599376, 0.12664199, 13.967811, 13.882815, 44.857395
+]
+
+[model_params]
+main_steps = 2  # 2 * num_pairs
+main_spatch = 4
+main_tpatch = 1
+main_inchans = 6
+aux_size = 36
+aux_steps = 3  # 2 * num_pairs + 1
+aux_spatch = 2
+aux_tpatch = 2
+aux_inchans = [2, 9]
+embed_dim = 96
+out_chans = 6
+depths = [2, 2, 6, 2]
+num_heads = [3, 6, 12, 24]
+window_sizes = [[2, 8, 8], [2, 8, 8], [2, 4, 4], [2, 4, 4]]  # This item should be converted to [tuple] for model compatibility.

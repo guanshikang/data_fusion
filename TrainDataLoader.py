@@ -42,8 +42,9 @@ class TrainDataLoader(data_utils.Dataset):
                  stats: dict=None,  # if not None, calculated stats will be used for standardization.
                  temporal_mode: str='All',  # 'All' or 'Left', two sides or left side of target date to reconstruct or predict. Case Insensitive.
                  Landsat: str='Single',  # 'Single' or 'Union', Only L8 / L8 & L9. Case Insensitive.
+                 modis_upsample: bool=False,  # if upsample MODIS to keep same size with Landsat.
                  update_dataset_file: str=None,  # update dataset_file_name. [dataset_file_name_{'train', 'val', and 'test'}].
-                 indexing: bool=False,  # if indexing ahead.
+                 indexing: bool=False,  # this parameter is used for preindexing.
                  progressive_config: dict=None,  # progressive training configuration.
                 ):
         self.landsat_path = landsat_path
@@ -53,10 +54,11 @@ class TrainDataLoader(data_utils.Dataset):
         self.image_size = image_size
         self.num_pairs = num_pairs
         self.cloud_cover = cloud_cover
-        self.site_names = self.__get_sitenames()
+        self.site_names = self.__get_sitenames() if len(files) > 0 else []
         self.stats = stats
         self.temporal_mode = temporal_mode or 'All'
         self.Landsat = Landsat or "Single"
+        self.modis_upsample = modis_upsample
 
         # for searching input index
         self.update_dataset_file = update_dataset_file
@@ -101,7 +103,7 @@ class TrainDataLoader(data_utils.Dataset):
                 'reflectance_max': 1.5
             }
 
-    def _landsat_cleaning(self, data):
+    def _data_cleaning(self, data):
         threshold = self._get_progressive_threshold()
         valid_mask = (data >= threshold['reflectance_min']) & \
             (data <= threshold['reflectance_max'])
@@ -172,16 +174,42 @@ class TrainDataLoader(data_utils.Dataset):
 
             return [x[0] for x in idx]
 
+    def __nearest_couple_idx(self,
+                       idx: np.ndarray,
+                       target: int
+                       ) -> tuple[int, int]:
+        """
+        Due to the need of two nearest elements for Landsat, the logic of this is
+        to find left and right element of target using two pointer to find them.
+        """
+        left, right = 0, len(idx) - 1
+
+        # Cross edge process.
+        if target <= idx[0] or target >= idx[-1]:
+            return np.nan, np.nan
+
+        while left < right - 1:
+            mid = (left + right) // 2
+            if idx[mid] < target:
+                left = mid
+            else:
+                right = mid
+
+        return left, right
+
     def _time_index(self,
                     target_date: datetime,
                     landsat_dst: xr.Dataset,
                     modis_dst: xr.Dataset,
                     landsat_mask: xr.Dataset
-                    ) -> tuple[np.ndarray, np.ndarray]:
+                    ) -> tuple[np.ndarray, np.ndarray, list, int]:
         """
         Search input data index. Logic is to filter desired dates (seasonal and less
-        than maximum cloud ratio), find idx1 neareat to target date, and find idx2
-        nearest to idx1, then find min_idx and max_idx according to idx2.
+        than maximum cloud ratio), find idx1 nearest to target date, and find idx2
+        nearest to idx1, then find min_idx and max_idx according to idx2. MODIS idx
+        is corresponding index of Landsat on its own dataset.
+
+        ltarget_idx and mtarget_idx are used for handling boundary situation.
         """
         date = nc.date2num(target_date, units=UNIT, calendar=CALENDAR)
         landsat_time = landsat_dst['time']
@@ -199,14 +227,15 @@ class TrainDataLoader(data_utils.Dataset):
                 idx.append(i)
         idx = np.array(idx)
         if self.Landsat.lower() == "union":
-            target_idx = np.argwhere(idx == least_idx)
-            if target_idx.size > 0:
-                idx = np.delete(idx, target_idx)  # if "Union", idx list contains [least_idx].
+            temp_idx = np.argwhere(idx == least_idx)
+            if temp_idx.size > 0:
+                idx = np.delete(idx, temp_idx)  # if "Union", idx list contains [least_idx].
         if len(idx) == 0:
             return [], []
-        temp_idx = np.argmin(np.abs(idx - least_idx))  # idx nearset to least_idx.
+        couple_idx = self.__nearest_couple_idx(idx, least_idx)  # two idx nearest to least_idx.
         temp_len = len(idx)
-        min_idx, max_idx = temp_idx - llength // 2, temp_idx + llength // 2
+        min_idx = couple_idx[0] - (llength // 2 - 1)  # left have contained one element
+        max_idx = couple_idx[1] + (llength // 2 - 1)  # right have contained one element
         # Ensure edge date find enough input data.
         if min_idx < 0:
             min_idx = 0
@@ -214,13 +243,17 @@ class TrainDataLoader(data_utils.Dataset):
         elif max_idx > temp_len - 1:
             max_idx = temp_len
             min_idx = max_idx - llength
-        lidx = idx[min_idx:max_idx]
+        lidx = idx[min_idx:max_idx + 1]
+        landsat_idx = np.array(season_idx_landsat)[lidx]  # target index of landsat
+        ltarget_idx = [i for i, x in enumerate(lidx) if x in idx[list(couple_idx)]]
 
         # * Same logic for MODIS
+        # * find landsat date for modis searching
+        sub_landsat_time = landsat_time[landsat_idx].values
         modis_time = modis_dst['time']
         season_idx_modis = self.__filter_by_season(target_date,
                                                    modis_time,
-                                                   same_year=True)
+                                                   same_year=False)
         season_modis = modis_time[season_idx_modis]
         mlength = llength + 1
         while len(season_idx_modis) < mlength:  # MODIS needs include one more than Landsat
@@ -233,18 +266,29 @@ class TrainDataLoader(data_utils.Dataset):
         #         season_idx_modis = np.concatenate((season_idx_modis, [least_midx]))  # there is a problem.
         #     else:  # this logic is also acceptable, but to keep align with Landsat, so still choose [leaset_idx] from [season_modis].
         #         raise IndexError(f"{site_name} did not obey the seasonal MODIS searching logic.")
-        min_idx, max_idx = least_midx - mlength // 2, least_midx + mlength // 2
-        if min_idx < 0:
-            min_idx = 0
-            max_idx = min_idx + mlength
-        elif max_idx > len(season_idx_modis) - 1:
-            max_idx = len(season_idx_modis)
-            min_idx = max_idx - mlength
-        midx = list(range(min_idx, max_idx))
-        if len(midx) != mlength:
-            midx = list(range(min_idx, max_idx + 1))
+        """
+        Comments below are the logic for finding neareast modis of target date.
+        But dates corresponding to landsat is more rational.
+        """
+        # min_idx, max_idx = least_midx - mlength // 2, least_midx + mlength // 2
+        # if min_idx < 0:
+        #     min_idx = 0
+        #     max_idx = min_idx + mlength
+        # elif max_idx > len(season_idx_modis) - 1:
+        #     max_idx = len(season_idx_modis)
+        #     min_idx = max_idx - mlength
+        # midx = list(range(min_idx, max_idx))
+        # if len(midx) != mlength:
+        #     midx = list(range(min_idx, max_idx + 1))
+        midx = []
+        for time in sub_landsat_time:
+            temp_idx = np.argmin(np.abs(season_modis.values - time))
+            midx.append(temp_idx)
+        _, mtarget_idx = self.__nearest_couple_idx(midx, least_midx)  # right idx is insertion place.
+        midx.insert(mtarget_idx, least_midx)
+        modis_idx = np.array(season_idx_modis)[midx]
 
-        return np.array(season_idx_landsat)[lidx], np.array(season_idx_modis)[midx]
+        return landsat_idx, modis_idx, ltarget_idx, mtarget_idx
 
     def _get_idx(self,
                  file: str|dict,  # label path or dict [label path, searched dataset index, optional].
@@ -258,6 +302,8 @@ class TrainDataLoader(data_utils.Dataset):
             label_path = file['label_path']
             landsat_idx = file['landsat_idx']
             modis_idx = file['modis_idx']
+            ltarget_idx = file['ltarget_idx']
+            mtarget_idx = file['mtarget_idx']
             if len(landsat_idx) != self.num_pairs * 2 and \
                 len(modis_idx) != self.num_pairs * 2 + 1:
                     raise ValueError("Provided index are mismatch with desired length.")
@@ -267,6 +313,8 @@ class TrainDataLoader(data_utils.Dataset):
                 label_path = file['label_path']
                 landsat_idx = file['landsat_idx']
                 modis_idx = file['modis_idx']
+                ltarget_idx = file['ltarget_idx']
+                mtarget_idx = file['mtarget_idx']
                 if len(landsat_idx) != self.num_pairs * 2 and \
                     len(modis_idx) != self.num_pairs * 2 + 1:
                         raise ValueError("Provided index are mismatch with desired length.")
@@ -280,10 +328,10 @@ class TrainDataLoader(data_utils.Dataset):
                 if not os.path.exists(file):
                     raise FileNotFoundError(f"Label: {file} doesn't exist.")
                 date = datetime.strptime(re.findall("\\d{8}", file)[0], "%Y%m%d")
-                landsat_idx, modis_idx = self._time_index(date,
-                                                        landsat_dst,
-                                                        modisQ_dst,
-                                                        landsat_mask)
+                landsat_idx, modis_idx, ltarget_idx, mtarget_idx = self._time_index(date,
+                                                                                    landsat_dst,
+                                                                                    modisQ_dst,
+                                                                                    landsat_mask)
                 if len(landsat_idx) < 2 * self.num_pairs:
                     print(site_name, date)
 
@@ -296,7 +344,7 @@ class TrainDataLoader(data_utils.Dataset):
             else:
                 raise ValueError("Temporal_mode only supports 'ALL' or 'LEFT', please modify its value.")
 
-        return label_path, landsat_idx, modis_idx
+        return label_path, landsat_idx, modis_idx, ltarget_idx, mtarget_idx
 
     def __load_data(self,
                     site_name: str
@@ -330,30 +378,39 @@ class TrainDataLoader(data_utils.Dataset):
         landsat_dst, landsat_mask, modisQ_dst, modisA_dst = self.__load_data(site_name)
         # find input index
         file = self.files[item]
-        label_path, landsat_idx, modis_idx = self._get_idx(file,
-                                                           landsat_dst,
-                                                           modisQ_dst,
-                                                           landsat_mask,
-                                                           site_name)
+        label_path, landsat_idx, modis_idx, ltarget_idx, mtarget_idx = self._get_idx(file,
+                                                                                     landsat_dst,
+                                                                                     modisQ_dst,
+                                                                                     landsat_mask,
+                                                                                     site_name)
         if self.indexing:  # In indexing process, only iter the dataset and no further process.
-            return label_path, landsat_idx, modis_idx
+            return label_path, landsat_idx, modis_idx, ltarget_idx, mtarget_idx
 
         # Extract landsat
-        landsat = landsat_dst[landsat_idx].values.transpose(1, 0, 2, 3)  # band first
+        sub_landsat = landsat_dst[landsat_idx]
+        landsat = sub_landsat.values.transpose(1, 0, 2, 3)  # band first
         band_order = [1, 2, 3, 4, 5, 6]
         landsat = landsat[band_order, ...]
         landsat = landsat * 2.75e-5 - 0.2
-        landsat, valid_mask = self._landsat_cleaning(landsat)
+        landsat, valid_mask = self._data_cleaning(landsat)
 
         # Extract MOD09Q1
-        modis_Q = modisQ_dst['data'][modis_idx].values.transpose(1, 0, 2, 3)
+        sub_modis_Q = modisQ_dst['data'][modis_idx]
+        modis_Q = sub_modis_Q.values.transpose(1, 0, 2, 3)
         modis_Q = modis_Q * 1e-4
+        modis_Q, _ = self._data_cleaning(modis_Q)
         # Extract MOD09A1
-        modis_A = modisA_dst['data'][modis_idx].values.transpose(1, 0, 2, 3)
+        sub_modis_A = modisA_dst['data'][modis_idx]
+        if self.modis_upsample:
+            sub_modis_A = sub_modis_A.interp(lon=sub_landsat['lon'],
+                                             lat=sub_landsat['lat'],
+                                             method='linear',
+                                             kwargs={'fill_value': 'extrapolate'})
+        modis_A = sub_modis_A.values.transpose(1, 0, 2, 3)
         band_order = [2, 3, 0, 1, 5, 6, 7, 8, 9]
         modis_A = modis_A[band_order, ...].astype(np.float64)
-        modis_A[:7] = modis_A[:7] * 1e-4
-        modis_A[7:] = modis_A[7:] * 1e-2
+        modis_A[:6], _ = self._data_cleaning(modis_A[:6] * 1e-4)
+        modis_A[6:] = modis_A[6:] * 1e-2
 
         if self.stats is not None:
             landsat = self._standardization(landsat, "landsat")
@@ -372,7 +429,7 @@ class TrainDataLoader(data_utils.Dataset):
             band_order = [1, 2, 3, 4, 5, 6]
             label = label[band_order, ...]
             label = label * 2.75e-5 - 0.2
-            label, gt_mask = self._landsat_cleaning(label)
+            label, gt_mask = self._data_cleaning(label)
             label = torch.from_numpy(label)
             label = torch.squeeze(label).to(torch.float32)
             gt_mask = torch.from_numpy(gt_mask)
@@ -383,7 +440,9 @@ class TrainDataLoader(data_utils.Dataset):
                 "modis_Q": modis_Q,
                 "modis_A": modis_A,
                 "label": label,
-                "gt_mask": gt_mask
+                "gt_mask": gt_mask,
+                "ltarget_idx": ltarget_idx,
+                "mtarget_idx": mtarget_idx
             }
 
         return {

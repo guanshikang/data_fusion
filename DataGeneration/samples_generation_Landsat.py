@@ -10,14 +10,19 @@ Created on Wed Jan 08 15:17:06 2025, HONG KONG
 """
 import os
 import re
+import ast
 import glob
 import tqdm
+import json
 import shutil
 import random
+import argparse
 import numpy as np
 import pandas as pd
 import netCDF4 as nc
+import geopandas as gpd
 from osgeo import gdal, osr
+from shapely.geometry import Point
 from datetime import datetime
 from FunctionalCode.CommonFuncs import CommonFuncs
 
@@ -32,6 +37,13 @@ class DataCleaning(CommonFuncs):
         self.modis_dir = modis_dir
         self.points = self._read_csv(ref_point_path)
         self.output_dir = output_dir
+        # shp_path = "/fossfs/skguan/data_fusion/ref_image/WRS2_descending.shp"
+        # self.wrs = gpd.read_file(shp_path)  # self._calculate_tile
+        # self.points['lcheck'] = self.points.apply(
+        #     lambda df: self._check_tile(df['tile'], df['ref_ltile'], siteid=df['siteid']),
+        #     axis=1
+        # )
+        # self.points.to_csv(ref_point_path.replace(".csv", "_new.csv"))
 
     def _read_csv(self, path):
         """
@@ -41,7 +53,7 @@ class DataCleaning(CommonFuncs):
             path (str): point file path.
         """
         points = pd.read_csv(path)
-        points = points.dropna()
+        # points = points.dropna()
         if 'tile' in points.keys():
             pattern = "\\d+[\\.]\\d+"
             string = str(points['tile'].iloc[0])
@@ -49,18 +61,105 @@ class DataCleaning(CommonFuncs):
             if regex:
                 points['tile'] = points['tile'].astype(int)
 
-        points['tile'] = points['tile'].astype(str)
+            points['tile'] = points['tile'].astype(str)
+        elif 'htile' in points.keys():
+            points['tile'] = points['htile'].map(str) + \
+                points['vtile'].map(lambda x: str(x).zfill(3))
+
         return points
 
-    def cloud_process_landsat(self):
+    def _filter_tiles(self, log_files):
+        pattern = r"There are bad lines in LC0[89]_L2SP_(?P<tile1>\d{6})|Went wrong for QA File of LC0[89]_L2SP_(?P<tile2>\d{6})"
+        tiles = []
+        for log_file in log_files:
+            with open(log_file, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    regex = re.match(pattern, line)
+                    if regex is not None:
+                        tile = regex.group("tile1") or regex.group("tile2")
+                        tiles.append(tile)
+
+        return tiles
+
+    def _query_tile(self, site_id, lon, lat):
+        """
+        根据降轨文件计算tile (高纬可能存在部分重轨).
+
+        Args:
+            lon (float): longitude of POI.
+            lat (float): latitude of POI.
+        """
+
+        point = Point(lon, lat)
+        in_tile = self.wrs[self.wrs.contains(point)]
+        if not in_tile.empty:
+            tiles = []
+            for i in range(len(in_tile)):
+                path = in_tile.iloc[i]['PATH']
+                row = in_tile.iloc[i]['ROW']
+                tiles.append("{}{:0>3}".format(path, row))
+            return tiles
+        else:
+            print(f"Did not find any tile for the {site_id}.")
+
+    def _check_tile(self, tile, ref_tile, lcheck=np.nan, siteid=None, flag=0):
+        """
+        由于错误tile也提出了图像(重叠部分有一个tile全为0)，所以需要逐一排查.
+
+        Args:
+            tile (str): current tile.
+            ref_tile (list): reference tile list. str.
+            siteid (str): target site id.
+            flag (int): preprocessing (0) or filtering stage (1).
+        """
+        if flag == 0:  # 预处理阶段
+            if tile in ref_tile and len(ast.literal_eval(ref_tile)) == 1:
+                return ""
+            else:
+                ref_dir = os.path.join(self.output_dir, "random_landsat", siteid)
+                if not os.path.exists(ref_dir):
+                    return ""
+                else:
+                    os.chdir(ref_dir)
+                ref_path = os.listdir()[0]
+                ref_data = gdal.Open(ref_path).ReadAsArray()[5:7, :, :]
+                if np.all(ref_data == 0):
+                    return "other"
+                elif np.any(ref_data == 0):
+                    return "cross"
+                else:
+                    return ""
+        elif flag == 1:  # 数据筛选阶段
+            if not pd.notna(lcheck):
+                return tile
+            else:
+                tile_ls = ast.literal_eval(ref_tile)
+                return [x for x in tile_ls if x != tile][0]
+        else:
+            """
+            0: Preprocessing stage for determining how many tiles the site need.
+            1: Filtering stage for tackling the zero site.
+            """
+            raise ValueError(f"Expected 0 or 1, but got {flag}")
+
+    def cloud_process_landsat(self, log_file=None):
         """
         使用cloud mask对landsat数据进行云处理 QA_PIXEL
         """
+        tiles = []
+        if log_file is not None:
+            tiles = self._filter_tiles(log_file)  # 进入内部进行筛选自定义
+        # self.points = self.points[self.points['lcheck'] == "cross"]
+        self.points['tile'] = self.points.apply(
+            lambda df: self._check_tile(df['tile'], df['ref_ltile'], df['lcheck'], flag=1),
+            axis=1
+        )
         keys = set(self.points['tile'])
         key_num = len(keys)
         progressor = tqdm.tqdm(enumerate(keys))
         for i, key in progressor:
-            if (key == "") or (pd.isna(key)):
+            if (key == "") or (pd.isna(key)) or (key not in tiles):
                 continue
 
             progressor.set_description(
@@ -70,13 +169,13 @@ class DataCleaning(CommonFuncs):
             )
             # 对Landsat数据进行去云和光谱拼接处理.
             landsat_path = os.path.join(self.landsat_dir, key[:3], key[3:], "202[2-4]", "*")
-            directories = glob.glob(landsat_path)
+            directories = glob.iglob(landsat_path)
             for directory in directories:
                 files = os.listdir(directory)
                 if len(files) == 0:
                     continue
-                sr_pattern = ".*B[1-7]+.TIF"
-                qa_pattern = ".*QA_PIXEL.TIF"
+                sr_pattern = "^.*B[1-7]+.TIF$"
+                qa_pattern = "^.*QA_PIXEL.TIF$"
                 qa_path = list(map(
                     lambda x: os.path.join(directory, x), filter(
                         lambda x: re.match(qa_pattern, x), files)
@@ -87,14 +186,8 @@ class DataCleaning(CommonFuncs):
                 ))
                 sr_path.sort()
                 try:
-                    cloud_mask = self.cloud_mask(qa_path)
-                    clear_mask = ~cloud_mask[np.newaxis, :, :]
                     file_info = self.get_fileinfo(sr_path[0])
-                    sr_data = self.spectral_concate(sr_path)
-
-                    # clear_sky = sr_data * ~c_mask
-                    sr_data = np.concatenate((sr_data, clear_mask), axis=0)
-                    samples = self.sampling(sr_data, file_info, key=key)
+                    samples = self.sampling(qa_path, sr_path, file_info, key=key)
                     prefix_name, date = self.acquire_productID(sr_path[0])
 
                 except Exception as e:
@@ -116,12 +209,12 @@ class DataCleaning(CommonFuncs):
                     # lon_seed, lat_seed = sample['lon_seed'], sample['lat_seed']
                     site_id = sample['site_id']
 
-                    landsat_dir = os.path.join(self.output_dir, "rpt_landsat", site_id)
+                    landsat_dir = os.path.join(self.output_dir, "random_landsat", site_id)
                     if not os.path.exists(landsat_dir):
                         os.makedirs(landsat_dir)
                     landsat_path = os.path.join(landsat_dir, f"{prefix_name}.tif")
-                    if os.path.exists(landsat_path):
-                        continue
+                    # if os.path.exists(landsat_path):
+                    #     continue
                     super().save_image(
                         sr_path[0], landsat_path, sub_img,
                         sample['scol'], sample['srow']
@@ -129,7 +222,7 @@ class DataCleaning(CommonFuncs):
 
     def modis_paired(self, src_path, tar_ls):
         """
-        找到landsat sample对应的modis图像上的sample.
+        找到landsat ample对应的modis图像上的sample.
 
         Args:
             src_path (str): source file path.
@@ -261,19 +354,22 @@ class DataCleaning(CommonFuncs):
 
         return prefix_name, date
 
-    def sampling(self, data_array, file_info, key=None, image_size=256, seed_num=10, cloud_cover=95):
+    def sampling(self, qa_path, sr_path, file_info, key=None, image_size=256, seed_num=10, cloud_cover=95):
         """
         对Landsat数据以指定窗口大小进行采样.
         或以经纬度中心膨胀.
         cloud_cover需要满足一定要求.
 
         Args:
-            data_array (ndarray): data array to be sampled randomly.
+            qa_path (str): quality control file path.
+            sr_path (str): surface reflectance file path.
+            file_info (list): reference file info.
             key (str): tile of point location.
             image_size (int):  image size of samples for SR.
             random_seed (int): number of subimgs.
         """
         if key is None:
+            data_array = file_info['src_ds'].ReadAsArray()
             width = data_array.shape[1]
             length = data_array.shape[2]
             lon_num = int(length / image_size)
@@ -304,7 +400,7 @@ class DataCleaning(CommonFuncs):
             df = self.points['tile']
             df = self.points[self.points['tile'] == key]
             step = int(image_size / 2)
-            size = max(data_array.shape)
+            size = max(file_info['width'], file_info['length'])
             for id, lon, lat in zip(df['siteid'], df['lon'], df['lat']):
                 x, y, _ = self.lonlat2xy(file_info['pcs'], file_info['gcs'], lon, lat)
                 row, col = self.xy2rowcol(file_info['geotrans'], x, y)
@@ -313,7 +409,19 @@ class DataCleaning(CommonFuncs):
                 flag = [(x < 0) | (x > size) for x in [srow, erow, scol, ecol]]
                 if any(flag):
                     continue
-                sub_img = data_array[:, srow:erow, scol:ecol]
+                sub_offset = {'xoff': scol, 'yoff': srow,
+                              'xsize': ecol - scol, 'ysize': erow - srow}
+                cloud_mask = self.cloud_mask(qa_path, **sub_offset)
+                if cloud_mask is None:
+                    continue
+                clear_mask = ~cloud_mask[np.newaxis, :, :]
+                sub_img = self.spectral_concate(sr_path, **sub_offset)
+                if sub_img is None:
+                    print(f"{id} has been skipped for the bad lines of source data.")
+                    continue
+
+                # clear_sky = sr_data * ~c_mask
+                sub_img = np.concatenate((sub_img, clear_mask), axis=0)
 
                 # cloud_cover = self.cloud_coverage(sub_img)
 
@@ -372,32 +480,58 @@ class DataCleaning(CommonFuncs):
             resampleAlg=gdal.GRA_Bilinear
         )
 
-    def spectral_concate(self, sr_path):
+    def spectral_concate(self, sr_path, xoff=0, yoff=0, xsize=None, ysize=None):
         """
         对landsat数据进行波段拼接
 
         Args:
             sr_path (str): reflectance file path.
+            xoff (int): offset for x (col) to read.
+            yoff (int): offset for y (row) to read.
+            xsize (int): length of x direction.
+            ysize (int): width of y direction.
         """
         sr_ds = map(lambda x: gdal.Open(x), sr_path)
-        sr_data = list(map(lambda x: x.GetRasterBand(1).ReadAsArray(), sr_ds))
-        data = np.array(sr_data)
+        try:
+            sr_data = list(map(
+                lambda x: x.GetRasterBand(1).ReadAsArray(xoff, yoff, xsize, ysize),
+                sr_ds
+            ))
+        except AttributeError:
+            print(f"There are 0 kb files for {os.path.split(sr_path[0])[-2]}")
+            return None
+        if any(x is None for x in sr_data):
+            for i, band in enumerate(sr_data):
+                if band is None:
+                    print(f"There are bad lines in {os.path.split(sr_path[i])[-1]}")
+            return None
+        else:
+            data = np.array(sr_data)
+            return data
 
-        return data
 
-    def cloud_mask(self, qa_path):
+    def cloud_mask(self, qa_path, xoff=0, yoff=0, xsize=None, ysize=None):
         """
         返回landsat数据的云掩膜
 
         Args:
             qa_path (str): cloud mask file path.
+            xoff (int): offset for x (col) to read.
+            yoff (int): offset for y (row) to read.
+            xsize (int): length of x direction.
+            ysize (int): width of y direction.
         """
-        qa_ds = gdal.Open(qa_path)
-        qa_band = qa_ds.GetRasterBand(1)
-        qa_data = qa_band.ReadAsArray()
-        cloud_mask = qa_data & 0b11111
-
-        return cloud_mask.astype(bool)
+        try:
+            qa_ds = gdal.Open(qa_path)
+            qa_band = qa_ds.GetRasterBand(1)
+            qa_data = qa_band.ReadAsArray(xoff=xoff, yoff=yoff,
+                                          win_xsize=xsize, win_ysize=ysize)
+            cloud_mask = qa_data & 0b11111
+        except Exception:
+            print(f"Went wrong for QA File of {os.path.split(qa_path)[-1]}.")
+            return None
+        else:
+            return cloud_mask.astype(bool)
 
     def find_landsat_tiles(self, ref_dir, image_size: int = 256):
         """
@@ -420,6 +554,7 @@ class DataCleaning(CommonFuncs):
         temp_dict = {
             "siteid": [""] * point_num,
             "tile": [""] * point_num,
+            "ltile": [""] * point_num,  # 高纬地区可能有重叠
             "lon": self.points['lon'],
             "lat": self.points['lat'],
             "row": [0] * point_num,
@@ -459,12 +594,15 @@ class DataCleaning(CommonFuncs):
                         continue
                     sub_data = data[srow:erow, scol:ecol]
                     ratio = np.sum((sub_data != 65535) & (np.max(sub_data) != 0)) / (image_size * image_size)
-                    if ratio > 0.95 or temp_dict['siteid'][i] == "":
+                    if ratio > 0.95:
                         try:
                             tile = re.match(".*LC0[89]_L2SP_(\\d+).*", file).group(1)
                             temp_dict['siteid'][i] = siteid
-                            temp_dict['tile'][i] = tile
-                            temp_dict['row'][i] = row
+                            if temp_dict['tile'][i] == "":
+                                temp_dict['tile'][i] = tile
+                            else:
+                                temp_dict['ltile'][i] = tile
+                            temp_dict['row'][i] = row  # 不采用，提点时重新计算row_col，但保留作为参考.
                             temp_dict["col"][i] = col
                             flag.append(i)
                         except Exception as e:
@@ -508,13 +646,13 @@ class DataCleaning(CommonFuncs):
         Args:
             output_dir (str): output directory for labels.
         """
-        input_dir = os.path.join(self.output_dir, "landsat")
-        files = glob.glob(os.path.join(input_dir, "*", "LC09*"))
+        input_dir = os.path.join(self.output_dir, "random_landsat")
+        files = glob.iglob(os.path.join(input_dir, "*", "LC09*"))
         for file in tqdm.tqdm(files):
             dst = gdal.Open(file)
-            data = dst.ReadAsArray()
+            data = dst.GetRasterBand(8).ReadAsArray()
             bg_pixels = np.sum(data[-1] == 0)
-            cloud_ratio = bg_pixels / (data.shape[1] * data.shape[2])
+            cloud_ratio = bg_pixels / (data.shape[0] * data.shape[1])
             cloud_ratio *= 100
             if cloud_ratio == 0:
                 site_id = file.split("/")[-2]
@@ -532,8 +670,7 @@ class DataCleaning(CommonFuncs):
         """
         paths = map(
             lambda x: os.path.join(input_dir, x),
-            # os.listdir(input_dir)
-            ["K04"]
+            filter(lambda y: re.match(r"r\d+?", y), os.listdir(input_dir))
         )
         progressor = tqdm.tqdm(paths)
         for i, path in enumerate(progressor):
@@ -551,6 +688,9 @@ class DataCleaning(CommonFuncs):
                 lambda x: re.match("LC0[89].*_\\d{6}_202[2-4]\\w*", x),
                 os.listdir(path)
             ))
+            if len(files) == 0:
+                print(f"{site_name} is skipped for the empty directory.")
+                continue
             files.sort(key=lambda x: re.findall("\\d{8}", x)[0])
             flag = [x[3] for x in files]
             data = list(map(lambda x: gdal.Open(x).ReadAsArray(), files))
@@ -575,25 +715,32 @@ class DataCleaning(CommonFuncs):
 
             band_num = data[0].shape[0]
             try:
-                self.create_nc(output_name, data, lon, lat, time, band_num,
-                               mask=-1, flag=flag)
+                self.save_nc(output_name, data, lon, lat, time, band_num,
+                             mask=-1, flag=flag)
             except Exception as e:
                 print(f"{site_name} arised an error: {e}")
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--category', required=True, help='Requested Funcation')
+    args = parser.parse_args()
+    category = args.category
+
     IMAGE_SIZE = 256
-    point_path = "/fossfs/skguan/data_fusion/sites_landsat.csv"
+    point_path = "/fossfs/skguan/data_fusion/split_dataset/original_sites/random_sites_new.csv"
     ref_dir = "/fossfs/skguan/data_fusion/ref_image"
-    landsat_dir = "/fossfs/DATAPOOL/Landsat_L2"
+    landsat_dir = "/fossfs/skguan/DATA/10.Landsat_L2_p"
     output_dir = "/fossfs/skguan/data_fusion"
     label_dir = "/fossfs/skguan/data_fusion/labels"
     dc = DataCleaning(landsat_dir, ref_point_path=point_path, output_dir=output_dir)
-    # dc.find_landsat_tiles(ref_dir, image_size=IMAGE_SIZE)
-    # dc.cloud_process_landsat()
-    # dc.create_labels(label_dir)
-    concat_path = "/fossfs/skguan/data_fusion/landsat"
-    dc.concat2nc(concat_path)
+    # dc.find_landsat_tiles(ref_dir, image_size=IMAGE_SIZE)  # 可以直接计算所在tile
+    # dc.cloud_process_landsat(["slurm-2361279.out", "slurm-2367512.out", "slurm-2372150.out", "slurm-2375787.out", "slurm-2381215.out", "slurm-2382009.out"])
+    if category == "L":
+        dc.create_labels(label_dir)
+    elif category == "C":
+        concat_path = "/fossfs/skguan/data_fusion/random_landsat"
+        dc.concat2nc(concat_path)
 
 
 if __name__ == "__main__":

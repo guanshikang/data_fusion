@@ -20,6 +20,7 @@ import tomllib
 import argparse
 from Trainer import Trainer
 from losses.FusionLoss import FusionLoss
+from Benchmark.SwinSTFM.models.swinstfm import SwinSTFM
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Triain Model.')
@@ -49,10 +50,24 @@ def parse_args():
 
     return cfg, checkpoint_path
 
+def custom_model(cfg):
+    # custom your model here, including model, optimizer, scheduler and criterion.
+    model = None
+    optimizer = None
+    scheduler = None
+    criterion = FusionLoss(cfg['loss_weights'])
+
+    return {
+        'model': model,
+        'optimizer': optimizer,
+        'scheduler': scheduler,
+        'criterion': criterion
+    }
+
 def main():
     cfg, checkpoint_path = parse_args()
-    criterion = FusionLoss(cfg['loss_weights'])
-    trainer = Trainer(cfg, checkpoint_path, criterion=criterion)
+    settings = custom_model(cfg)
+    trainer = Trainer(cfg, checkpoint_path, **settings)
     trainer.build()
     trainer.run_train()
     trainer.run_test()

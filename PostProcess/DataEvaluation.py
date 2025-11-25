@@ -1,7 +1,14 @@
+# -*- encoding: utf-8 -*-
+"""
+@type: module
+
+@brief: calculate validation statistical indicators.
+
+@author: guanshikang
+
+Created on Wed Oct 15 21:57:51 2025, HONG KONG
+"""
 import os
-import re
-import glob
-import shutil
 import numpy as np
 import pandas as pd
 from osgeo import gdal
@@ -10,32 +17,14 @@ from sklearn.metrics import root_mean_squared_error as RMSE
 from sklearn.metrics import mean_absolute_error as MAE
 from skimage.metrics import peak_signal_noise_ratio as PSNR
 from skimage.metrics import structural_similarity as SSIM
-from FunctionalCode.CommonFuncs import CommonFuncs
 
-def cross_tile():
-    files = glob.iglob("/fossfs/skguan/data_fusion/labels/*/*.tif")
-    for file in files:
-        data = gdal.Open(file).ReadAsArray()
-        if np.any(data[5:7, :, :] == 0):
-            os.remove(file)
-            print(f"{file} has been reomved.")
-    print("All process done.")
 
-def empty_folder():
-    file_dir = "/fossfs/skguan/data_fusion/landsat"
-    sites = os.listdir(file_dir)
-    for site in sites:
-        files = glob.glob(os.path.join(file_dir, site, "*.tif"))
-        if len(files) == 0:
-            file_path = os.path.join(file_dir, site)
-            shutil.rmtree(file_path)
-            print(f"{file_path} has been removed.")
-
-class DataProcess():
+class DataEvaluation:
     def __init__(self):
         pass
 
-    def SAM(self, reference_spectrum, target_spectrum):
+    @staticmethod
+    def SAM(reference_spectrum, target_spectrum):
         """
         Calculate the spectral angle between two spectra.
 
@@ -62,7 +51,8 @@ class DataProcess():
 
         return angle
 
-    def ERGAS(self, reference, fused, resolution_ratio):
+    @staticmethod
+    def ERGAS(reference, fused, resolution_ratio):
         """
         Calculate the ERGAS metric.
 
@@ -94,27 +84,68 @@ class DataProcess():
         # Final ERGAS calculation
         ergas = resolution_ratio * np.sqrt(ergas_sum / bands)
         return ergas
-    def band_calculation(self):
-        file_dir = "/fossfs/skguan/output/data_fusion/val_files"
-        file_path = os.path.join(file_dir, "val_result_fold0_swin(random_dataset).npz")
-        label_max = np.array([65454., 65454., 65455., 65455., 65454., 65455.])
-        label_min = np.array([0., 0., 0., 0., 0., 0.])
+
+    def cal_npz(self, file_dir, file_name):
+        """
+        calculate statistical indicators for per band with nc format.
+
+        Args:
+            file_dir (str): e.g. "/fossfs/skguan/output/data_fusion/val_files"
+            file_path (str): e.g. "val_result_fold0_swin(free_cloud).npz"
+        """
+        file_path = os.path.join(file_dir, file_name)
 
         data = np.load(file_path)
-        label_data = data['label'] * 65455.0
-        pred_data = data['pred'] * 65455.0
+        label_data = data['label']
+        if label_data.ndim == 1:
+            label_data = label_data.reshape(-1, 6, 256, 256)
+        pred_data = data['pred']
+        if pred_data.ndim == 1:
+            pred_data = pred_data.reshape(-1, 6, 256, 256)
 
-        # label_data = np.power(label_data, 3)
-        # pred_data = np.power(pred_data, 3)
-        # label_data = label_data * (label_max[:, None, None] - label_min[:, None, None]) + label_min[:, None, None]
-        # pred_data = pred_data * (label_max[:, None, None] - label_min[:, None, None]) + label_min[:, None, None]
-        label_data = label_data * 2.75e-5 - 0.2
-        pred_data = pred_data * 2.75e-5 - 0.2
+        self._calculate(label_data, pred_data)
+
+    def cal_tif(self, file_dir, ref_csv):
+        """
+        calculate statistical indicators for per band with tif format.
+
+        Args:
+            file_dir (str): e.g. "/fossfs/skguan/output/data_fusion/benchmark/ESTARFM"
+            ref_csv (str): e.g. "/fossfs/skguan/data_fusion/dataset_23lr_c0n1.csv"
+
+            ref_csv is used to aviod same output_name (more than 1 sites) cauising
+            mismatch between predicted data and label.
+        """
+        df = pd.read_csv(ref_csv, usecols=["train", "val"])
+
+        label_data = []
+        pred_data = []
+        files = os.listdir(file_dir)
+        for file in files:
+            temp_file = os.path.join(file_dir, file)
+            ref_tfile = df['train'].dropna()[df['train'].dropna().str.contains(file)]
+            ref_vfile = df['val'].dropna()[df['val'].dropna().str.contains(file)]
+            if len(ref_tfile) + len(ref_vfile) == 1:
+                temp_data = gdal.Open(temp_file).ReadAsArray()
+                ref_file = ref_tfile.values or ref_vfile.values
+                ref_data = gdal.Open(ref_file[0]).ReadAsArray()
+                band_order = [1, 2, 3, 4, 5, 6]
+                ref_data = ref_data[band_order, ...]
+
+                pred_data.append(temp_data)
+                label_data.append(ref_data)
+
+        label_data = np.array(label_data)
+        pred_data = np.array(pred_data)
+
+        self._calculate(label_data, pred_data)
+
+    def _calculate(self, label_data, pred_data):
 
         labels = ["Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2"]
 
-        sam = self.SAM(label_data.reshape(-1,), pred_data.reshape(-1,))
-        ergas = self.ERGAS(label_data, pred_data, 1.0)
+        sam = DataEvaluation.SAM(label_data.reshape(-1,), pred_data.reshape(-1,))
+        ergas = DataEvaluation.ERGAS(label_data, pred_data, 1.0)
         print(f"SAM: {sam:.4f}, ERGAS: {ergas:.4f}")
 
         for i, label_name in enumerate(labels):
@@ -130,32 +161,22 @@ class DataProcess():
             print(f"{label_name}, R2: {r2:.3f}, RMSE: {rmse:.4f}, MAE: {mae:.3f}, "
                 f"PSNR: {psnr:.3f}, SSIM: {ssim: .3f}")
 
-def same_patch_check():
-    cf = CommonFuncs()
-    file_dir = "/fossfs/skguan/data_fusion/landsat"
-    site_names = os.listdir(file_dir)
-    point_dict = {
-        "site_id": [""] * len(site_names),
-        "lon_ul": [0.0] * len(site_names),
-        "lat_ul": [0.0] * len(site_names)
-    }
-    file_path = map(
-        lambda x: os.path.join(x, os.listdir(x)[1]), map(
-            lambda y: os.path.join(file_dir, y), site_names)
-    )
-    for i, file in enumerate(file_path):
-        min_x, max_y, _, _ = cf.get_extent(file)
-        site_name = file.split("/")[-2]
-        point_dict['site_id'][i] = site_name
-        point_dict['lon_ul'][i] = min_x
-        point_dict['lat_ul'][i] = max_y
-    df = pd.DataFrame(point_dict)
-    df = df.groupby([df['lon_ul'], df['lat_ul']]).aggregate({'site_id': 'first'})
-    df.to_csv("/fossfs/skguan/data_fusion/check.csv")
+def main():
+    """Comment the other variable for one operation [file_name] | [ref_csv]"""
+    file_dir = "/lustre1/g/geog_geors/skguan/data_fusion/output/data_fusion/val_files"
+    file_name = "val_result_swin(tanh).npz"
+    # ref_csv = "/fossfs/skguan/data_fusion/dataset_23lr_c0n1.csv"
+    dp = DataEvaluation()
+    try:
+        file_name
+        dp.cal_npz(file_dir, file_name)
+    except:
+        try:
+            ref_csv
+            dp.cal_tif(file_dir, ref_csv)
+        except:
+            print("Exit with no operations.")
+
 
 if __name__ == "__main__":
-    # cross_tile()
-    # empty_folder()
-    dp = DataProcess()
-    dp.band_calculation()
-    # same_patch_check()
+    main()
